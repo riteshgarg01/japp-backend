@@ -122,7 +122,7 @@ app = FastAPI(title="Arohi Backend", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if ALLOWED_ORIGINS == ["*"] else ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=ALLOWED_ORIGINS != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
