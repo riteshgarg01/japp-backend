@@ -13,7 +13,7 @@ Suggested env (.env):
   ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000
 """
 from __future__ import annotations
-import os, json, uuid
+import os, json, uuid, logging
 from typing import List, Optional
 from contextlib import contextmanager
 
@@ -172,6 +172,9 @@ def ai_describe(req: DescribeRequest):
         content = resp.choices[0].message.content or "{}"
         data = json.loads(content)
         return DescribeResponse(**data)
+    except json.JSONDecodeError:
+        logging.error("OpenAI returned invalid JSON: %s", content)
+        raise HTTPException(502, "Invalid response from OpenAI")
     except Exception as e:
         raise HTTPException(500, f"OpenAI error: {e}")
 
