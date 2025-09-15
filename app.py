@@ -16,6 +16,14 @@ from __future__ import annotations
 import os, json, uuid, logging
 from typing import List, Optional
 from contextlib import contextmanager
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Use Uvicorn's logger so messages show in the terminal
+# (print-style logging often doesn't appear when running behind Uvicorn/Gunicorn)
+LOGGER = logging.getLogger("uvicorn.error")
 
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +32,10 @@ from sqlalchemy import create_engine, Column, String, Integer, Boolean, JSON, te
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
 # ----- OpenAI (server-side only; never expose keys to frontend) -----
+# We import the SDK and try to create a client from the OPENAI_API_KEY
+# in your .env. If anything fails (no key, not installed, etc.), we
+# set the client to None and the API will fall back to a safe default
+# so local development keeps working.
 try:
     from openai import OpenAI
     _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -31,16 +43,49 @@ except Exception:
     _openai_client = None
 
 # ----- Config -----
+# All configuration is read from environment variables (see .env / .env.example)
+# so you can change behavior without touching the code. Reasonable defaults
+# are provided so the project runs out-of-the-box with SQLite.
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+pysqlite:///./arohi.db")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
+# Owner / brand config served to frontend
+OWNER_PHONE = os.getenv("OWNER_PHONE", "+919999999999")
+BRAND_NAME = os.getenv("BRAND_NAME", "Arohi's collection")
+# AI config
+# Model and prompts used by the /ai/describe endpoint. You can tweak these
+# in .env without changing code.
+AI_MODEL = os.getenv("AI_MODEL", "gpt-4o")
+AI_PROMPT_SYSTEM = os.getenv(
+    "AI_PROMPT_SYSTEM",
+    "You are a Product listing expert for a Shopify store that sells artificial jewelry in India.",
+)
+AI_PROMPT_USER = os.getenv(
+    "AI_PROMPT_USER",
+    (
+        "Please analyze these image(s) of artificial jewelry to be listed on the Shopify store.\n"
+        "Output must be STRICT JSON with keys: title, description, category.\n"
+        "A good listing uses a title and description that are relevant to the jewelry material and type, tailored for an Indian audience.\n"
+        "Avoid any words implying precious metals or real gemstones (gold, silver, diamond, etc.). Neutral descriptors allowed: 'silver-tone', 'kundan', 'polki', 'oxidized', 'meenakari', 'pearl', 'american diamond (AD)', 'moissanite'.\n"
+        "Category must be one of: Anklets, Bracelets, Brooches & Lapel Pins, Charms & Pendants, Earrings, Jewelry Sets, Necklaces, Rings.\n"
+        "If a necklace is shown with matching earrings, choose 'Jewelry Sets'. If only a necklace is present, choose 'Necklaces'. If only earrings, choose 'Earrings'."
+    ),
+)
 
 engine = create_engine(DATABASE_URL, future=True)
+# SessionLocal is a factory that gives us a new DB session for each request
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+# Base is the parent class for our ORM models (Product, Order, ...)
 Base = declarative_base()
 
 
 # ----- DB Models -----
 class Product(Base):
+    """Product catalog item stored in the database.
+
+    Notes:
+    - price is stored in paise (integer) to avoid floating point issues.
+    - images is a JSON array of URLs/base64 strings.
+    """
     __tablename__ = "products"
     id = Column(String, primary_key=True)  # e.g., Earrings-123456
     title = Column(String, nullable=False)
@@ -54,6 +99,10 @@ class Product(Base):
     updated_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
 
 class Order(Base):
+    """A customer shortlist or order.
+
+    We model a simple status field and a 1..N relationship to OrderItem.
+    """
     __tablename__ = "orders"
     id = Column(String, primary_key=True)  # e.g., ORD-xxx
     customer_phone = Column(String, nullable=False)
@@ -62,6 +111,7 @@ class Order(Base):
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
 
 class OrderItem(Base):
+    """Line items connecting Orders to Products."""
     __tablename__ = "order_items"
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     order_id = Column(String, ForeignKey("orders.id"), nullable=False)
@@ -70,10 +120,18 @@ class OrderItem(Base):
     order = relationship("Order", back_populates="items")
     product = relationship("Product")
 
+# Create tables automatically on startup for local dev (quick and simple).
+# For production, prefer Alembic migrations instead.
 Base.metadata.create_all(engine)
 
 @contextmanager
 def session_scope():
+    """Small helper to get a DB session with automatic commit/rollback.
+
+    Usage:
+        with session_scope() as db:
+            ... use db session ...
+    """
     db: Session = SessionLocal()
     try:
         yield db
@@ -85,6 +143,8 @@ def session_scope():
         db.close()
 
 # ----- Schemas -----
+# Pydantic models validate input and shape output for the API.
+# "In" models describe what the client sends, "Out" models what we return.
 class ProductIn(BaseModel):
     id: str
     title: str
@@ -110,15 +170,22 @@ class OrderOut(BaseModel):
     id: str; status: str; customer_phone: str; items: List[str]
 
 class DescribeRequest(BaseModel):
+    """Request body for /ai/describe.
+
+    The frontend sends one or more image URLs (can be data: URLs)
+    and the server asks the AI model to generate metadata.
+    """
     image_urls: List[str] = Field(default_factory=list)
 
 class DescribeResponse(BaseModel):
+    """Response body from /ai/describe: strictly JSON fields used by the UI."""
     title: str
     description: str
     category: str
 
 # ----- FastAPI -----
 app = FastAPI(title="Arohi Backend", version="0.1.0")
+# CORS allows the browser-based frontend (different port) to call this API.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if ALLOWED_ORIGINS == ["*"] else ALLOWED_ORIGINS,
@@ -131,54 +198,74 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
+@app.get("/config")
+def get_config():
+    """Public config consumed by the frontend (no secrets).
+
+    Returning this from the backend avoids hard-coding owner phone/brand
+    inside the frontend bundle.
+    """
+    return {"owner_phone": OWNER_PHONE, "brand_name": BRAND_NAME}
+
 # ---- S3 presign (PUT) ----
 # ---- AI describe (server calls OpenAI Vision) ----
-PROMPT = (
-    "You are a content writer for Shopify store that sells artificial jewelry in India. "
-    "Analyze the product image(s) and provide strictly JSON with keys: title, description, category. "
-    "Rules: Avoid any reference to imitation, gold, silver, or gemstones. "
-    "Audience: Indian women 18-50. "
-    "Category must be one of: 'Apparel & Accessories > Jewelry > Anklets', 'Apparel & Accessories > Jewelry > Bracelets', "
-    "'Apparel & Accessories > Jewelry > Brooches & Lapel Pins', 'Apparel & Accessories > Jewelry > Charms & Pendants', "
-    "'Apparel & Accessories > Jewelry > Earrings', 'Apparel & Accessories > Jewelry > Jewelry Sets', "
-    "'Apparel & Accessories > Jewelry > Necklaces', 'Apparel & Accessories > Jewelry > Rings'."
-)
 
 @app.post("/ai/describe", response_model=DescribeResponse)
 def ai_describe(req: DescribeRequest):
+    """Generate product title/description/category from image(s) using AI.
+
+    - Reads model and prompts from env (see AI_* variables above)
+    - Accepts image URLs (including base64 data URLs) from the frontend
+    - Returns a small JSON that the UI uses to prefill the upload form
+    """
     if not _openai_client:
         # Dev fallback: return neutral placeholders
-        return DescribeResponse(title="Elegant festive piece", description="Lightweight, versatile piece for everyday and festive looks.", category="Apparel & Accessories > Jewelry > Earrings")
+        return DescribeResponse(title="Error fetching title", description="Error fetching description", category="Earrings")
     if not req.image_urls:
         raise HTTPException(400, "image_urls required")
     try:
-        # Use a vision-capable model via Chat Completions
+        # Chat Completions with system + multimodal user content
         messages = [
-            {"role": "system", "content": PROMPT},
+            {"role": "system", "content": AI_PROMPT_SYSTEM},
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Generate JSON with keys: title, description, category."},
+                    {"type": "text", "text": AI_PROMPT_USER},
                     *[{"type": "image_url", "image_url": {"url": u}} for u in req.image_urls],
                 ],
             },
         ]
-        # Model name can be adjusted; choose a vision-capable model
+        # Ask the model (gpt-4o by default) to generate JSON only
         resp = _openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=AI_MODEL,
             messages=messages,
+            max_tokens=600,
             temperature=0.2,
         )
         content = resp.choices[0].message.content or "{}"
-        data = json.loads(content)
+        if os.getenv("DEBUG_AI"):
+            LOGGER.info("AI describe raw content: %s", content)
+        # Best-effort JSON extraction in case the model wraps code fences
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            start = content.find("{")
+            end = content.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                data = json.loads(content[start:end+1])
+            else:
+                raise
+        if "description" not in data and "description_" in data:
+            data["description"] = data.get("description_")
         return DescribeResponse(**data)
     except json.JSONDecodeError:
-        logging.error("OpenAI returned invalid JSON: %s", content)
+        LOGGER.error("OpenAI returned invalid JSON: %s", content)
         raise HTTPException(502, "Invalid response from OpenAI")
     except Exception as e:
         raise HTTPException(500, f"OpenAI error: {e}")
 
 # ---- Products ----
+# CRUD endpoints used by both Customer and Owner apps
 @app.get("/products", response_model=ProductListOut)
 def list_products(category: Optional[str] = None, q: Optional[str] = None, min_price: Optional[int] = None, max_price: Optional[int] = None, only_available: bool = False):
     with session_scope() as db:
@@ -212,6 +299,7 @@ def list_products(category: Optional[str] = None, q: Optional[str] = None, min_p
 @app.post("/products", response_model=ProductOut)
 def create_product(p: ProductIn):
     with session_scope() as db:
+        LOGGER.info("Create product: id=%s, title=%s, cat=%s, images=%d", p.id, p.title, p.category, len(p.images or []))
         if db.get(Product, p.id):
             raise HTTPException(409, "Product ID already exists")
         m = Product(
@@ -231,6 +319,7 @@ def create_product(p: ProductIn):
 @app.patch("/products/{pid}", response_model=ProductOut)
 def update_product(pid: str, p: ProductIn):
     with session_scope() as db:
+        LOGGER.info("Update product: id=%s, title=%s, cat=%s, images=%d", pid, p.title, p.category, len(p.images or []))
         m: Product = db.get(Product, pid)
         if not m:
             raise HTTPException(404, "Product not found")
@@ -254,6 +343,8 @@ def delete_product(pid: str):
         return {"ok": True}
 
 # ---- Orders ----
+# A minimal flow: customers create a shortlist (an order with items),
+# owner confirms it which atomically decrements inventory.
 @app.post("/orders", response_model=OrderOut)
 def create_order(req: OrderCreate):
     if not req.items:
