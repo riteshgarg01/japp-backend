@@ -14,6 +14,7 @@ Suggested env (.env):
 """
 from __future__ import annotations
 import os, json, uuid, logging
+from pathlib import Path
 from typing import List, Optional
 from contextlib import contextmanager
 from dotenv import load_dotenv
@@ -46,7 +47,12 @@ except Exception:
 # All configuration is read from environment variables (see .env / .env.example)
 # so you can change behavior without touching the code. Reasonable defaults
 # are provided so the project runs out-of-the-box with SQLite.
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+pysqlite:///./arohi.db")
+#
+# Important: use an absolute path for the default SQLite DB so it stays
+# consistent regardless of where you run `uvicorn` from (Windows/WSL, ngrok, etc.).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_DB_PATH = _REPO_ROOT / "arohi.db"
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite+pysqlite:///{_DEFAULT_DB_PATH}")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
 # Owner / brand config served to frontend
 OWNER_PHONE = os.getenv("OWNER_PHONE", "+919999999999")
@@ -70,6 +76,7 @@ AI_PROMPT_USER = os.getenv(
         "If a necklace is shown with matching earrings, choose 'Jewelry Sets'. If only a necklace is present, choose 'Necklaces'. If only earrings, choose 'Earrings'."
     ),
 )
+AI_DEBUG = os.getenv("AI_DEBUG", "0").lower() in {"1", "true", "yes"}
 
 engine = create_engine(DATABASE_URL, future=True)
 # SessionLocal is a factory that gives us a new DB session for each request
@@ -196,7 +203,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "db": DATABASE_URL}
 
 @app.get("/config")
 def get_config():
@@ -218,9 +225,14 @@ def ai_describe(req: DescribeRequest):
     - Accepts image URLs (including base64 data URLs) from the frontend
     - Returns a small JSON that the UI uses to prefill the upload form
     """
-    if not _openai_client:
-        # Dev fallback: return neutral placeholders
-        return DescribeResponse(title="Error fetching title", description="Error fetching description", category="Earrings")
+    # If AI_DEBUG is enabled, or OpenAI client is unavailable, return a safe dummy
+    if AI_DEBUG or not _openai_client:
+        cat = "Jewelry Sets" if len(req.image_urls) != 1 else "Earrings"
+        title = "Elegant kundan jewelry set" if cat == "Jewelry Sets" else "Minimalist oxidized earrings"
+        description = (
+            "Developer mode (AI_DEBUG) is ON: sample metadata. Silver-tone detailing; suitable for festive and everyday wear."
+        )
+        return DescribeResponse(title=title, description=description, category=cat)
     if not req.image_urls:
         raise HTTPException(400, "image_urls required")
     try:
