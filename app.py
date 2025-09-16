@@ -168,6 +168,8 @@ class ProductOut(BaseModel):
 
 class ProductListOut(BaseModel):
     items: List[ProductOut]
+    total: Optional[int] = None
+    next_offset: Optional[int] = None
 
 class OrderCreate(BaseModel):
     items: List[str]  # product IDs; fixed quantity = 1 per item
@@ -279,7 +281,15 @@ def ai_describe(req: DescribeRequest):
 # ---- Products ----
 # CRUD endpoints used by both Customer and Owner apps
 @app.get("/products", response_model=ProductListOut)
-def list_products(category: Optional[str] = None, q: Optional[str] = None, min_price: Optional[int] = None, max_price: Optional[int] = None, only_available: bool = False):
+def list_products(
+    category: Optional[str] = None,
+    q: Optional[str] = None,
+    min_price: Optional[int] = None,
+    max_price: Optional[int] = None,
+    only_available: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+):
     with session_scope() as db:
         qry = db.query(Product)
         if category:
@@ -293,6 +303,13 @@ def list_products(category: Optional[str] = None, q: Optional[str] = None, min_p
             qry = qry.filter(Product.price_in_paise <= int(max_price) * 100)
         if only_available:
             qry = qry.filter(Product.available == True, Product.qty > 0)
+        total = qry.count()
+        page = (
+            qry.order_by(Product.created_at.desc())
+            .offset(max(0, int(offset)))
+            .limit(max(0, int(limit)))
+            .all()
+        )
         items = [
             ProductOut(
                 id=p.id,
@@ -304,9 +321,10 @@ def list_products(category: Optional[str] = None, q: Optional[str] = None, min_p
                 available=p.available,
                 images=p.images or [],
             )
-            for p in qry.order_by(Product.created_at.desc()).all()
+            for p in page
         ]
-        return {"items": items}
+        next_offset = (offset + limit) if (offset + limit) < total else None
+        return {"items": items, "total": total, "next_offset": next_offset}
 
 @app.post("/products", response_model=ProductOut)
 def create_product(p: ProductIn):
