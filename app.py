@@ -30,6 +30,7 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, String, Integer, Boolean, JSON, text, ForeignKey
+from datetime import datetime
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
 # ----- OpenAI (server-side only; never expose keys to frontend) -----
@@ -99,6 +100,7 @@ class Product(Base):
     description = Column(String, nullable=False)
     category = Column(String, index=True, nullable=False)
     price_in_paise = Column(Integer, nullable=False)
+    cost_in_paise = Column(Integer, nullable=False, default=0)
     qty = Column(Integer, nullable=False, default=0)
     available = Column(Boolean, nullable=False, default=True)
     images = Column(JSON, nullable=False, default=list)  # [url, ...]
@@ -115,6 +117,8 @@ class Order(Base):
     customer_phone = Column(String, nullable=False)
     status = Column(String, nullable=False, default="pending")  # pending | confirmed | cancelled
     created_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
+    confirmed_at = Column(String, nullable=True)
+    removed_items = Column(JSON, nullable=False, default=list)
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
 
 class OrderItem(Base):
@@ -130,6 +134,24 @@ class OrderItem(Base):
 # Create tables automatically on startup for local dev (quick and simple).
 # For production, prefer Alembic migrations instead.
 Base.metadata.create_all(engine)
+
+# Lightweight schema patch for SQLite: add columns if missing
+try:
+    with engine.connect() as conn:
+        # Products: add cost_in_paise if missing
+        cols_products = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(products)").fetchall()}
+        if "cost_in_paise" not in cols_products:
+            conn.exec_driver_sql("ALTER TABLE products ADD COLUMN cost_in_paise INTEGER DEFAULT 0")
+
+        # Orders: add confirmed_at and removed_items if missing
+        cols_orders = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(orders)").fetchall()}
+        if "confirmed_at" not in cols_orders:
+            conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN confirmed_at TEXT")
+        if "removed_items" not in cols_orders:
+            # JSON resolves to TEXT on SQLite; default to empty array
+            conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN removed_items JSON DEFAULT '[]'")
+except Exception as _e:
+    LOGGER.warning("Schema patch skipped/failure: %s", _e)
 
 @contextmanager
 def session_scope():
@@ -158,13 +180,14 @@ class ProductIn(BaseModel):
     description: str
     category: str
     price: int = Field(..., ge=0, description="Price in INR whole rupees")
+    cost: int = Field(0, ge=0, description="Optional cost in INR whole rupees")
     qty: int = Field(..., ge=0)
     available: bool = True
     images: List[str] = []
 
 class ProductOut(BaseModel):
     id: str; title: str; description: str; category: str
-    price: int; qty: int; available: bool; images: List[str]
+    price: int; cost: int; qty: int; available: bool; images: List[str]
 
 class ProductListOut(BaseModel):
     items: List[ProductOut]
@@ -177,6 +200,10 @@ class OrderCreate(BaseModel):
 
 class OrderOut(BaseModel):
     id: str; status: str; customer_phone: str; items: List[str]
+    created_at: Optional[str] = None
+    confirmed_at: Optional[str] = None
+    removed_items: Optional[List[str]] = []
+    created_at: Optional[str] = None
 
 class DescribeRequest(BaseModel):
     """Request body for /ai/describe.
@@ -280,7 +307,7 @@ def ai_describe(req: DescribeRequest):
 
 # ---- Products ----
 # CRUD endpoints used by both Customer and Owner apps
-@app.get("/products", response_model=ProductListOut)
+@app.get("/products", response_model=ProductListOut, response_model_exclude={"items": {"__all__": {"cost"}}})
 def list_products(
     category: Optional[str] = None,
     q: Optional[str] = None,
@@ -317,6 +344,55 @@ def list_products(
                 description=p.description,
                 category=p.category,
                 price=p.price_in_paise // 100,
+                cost=(getattr(p, 'cost_in_paise', 0) or 0) // 100,
+                qty=p.qty,
+                available=p.available,
+                images=p.images or [],
+            )
+            for p in page
+        ]
+        next_offset = (offset + limit) if (offset + limit) < total else None
+        return {"items": items, "total": total, "next_offset": next_offset}
+
+@app.get("/owner/products", response_model=ProductListOut)
+def list_products_owner(
+    category: Optional[str] = None,
+    q: Optional[str] = None,
+    min_price: Optional[int] = None,
+    max_price: Optional[int] = None,
+    only_available: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+):
+    # Same as public listing but includes cost in response
+    with session_scope() as db:
+        qry = db.query(Product)
+        if category:
+            qry = qry.filter(Product.category == category)
+        if q:
+            like = f"%{q}%"
+            qry = qry.filter((Product.title.ilike(like)) | (Product.description.ilike(like)))
+        if min_price is not None:
+            qry = qry.filter(Product.price_in_paise >= int(min_price) * 100)
+        if max_price is not None:
+            qry = qry.filter(Product.price_in_paise <= int(max_price) * 100)
+        if only_available:
+            qry = qry.filter(Product.available == True, Product.qty > 0)
+        total = qry.count()
+        page = (
+            qry.order_by(Product.created_at.desc())
+            .offset(max(0, int(offset)))
+            .limit(max(0, int(limit)))
+            .all()
+        )
+        items = [
+            ProductOut(
+                id=p.id,
+                title=p.title,
+                description=p.description,
+                category=p.category,
+                price=p.price_in_paise // 100,
+                cost=(getattr(p, 'cost_in_paise', 0) or 0) // 100,
                 qty=p.qty,
                 available=p.available,
                 images=p.images or [],
@@ -338,13 +414,14 @@ def create_product(p: ProductIn):
             description=p.description,
             category=p.category,
             price_in_paise=p.price * 100,
+            cost_in_paise=(p.cost or 0) * 100,
             qty=p.qty,
             available=p.available and p.qty > 0,
             images=p.images,
         )
         db.add(m)
         db.flush()
-        return ProductOut(id=m.id, title=m.title, description=m.description, category=m.category, price=m.price_in_paise // 100, qty=m.qty, available=m.available, images=m.images or [])
+        return ProductOut(id=m.id, title=m.title, description=m.description, category=m.category, price=m.price_in_paise // 100, cost=(m.cost_in_paise or 0)//100, qty=m.qty, available=m.available, images=m.images or [])
 
 @app.patch("/products/{pid}", response_model=ProductOut)
 def update_product(pid: str, p: ProductIn):
@@ -357,11 +434,12 @@ def update_product(pid: str, p: ProductIn):
         m.description = p.description
         m.category = p.category
         m.price_in_paise = p.price * 100
+        m.cost_in_paise = (p.cost or 0) * 100
         m.qty = p.qty
         m.available = p.available and p.qty > 0
         m.images = p.images
         db.flush()
-        return ProductOut(id=m.id, title=m.title, description=m.description, category=m.category, price=m.price_in_paise // 100, qty=m.qty, available=m.available, images=m.images or [])
+        return ProductOut(id=m.id, title=m.title, description=m.description, category=m.category, price=m.price_in_paise // 100, cost=(m.cost_in_paise or 0)//100, qty=m.qty, available=m.available, images=m.images or [])
 
 @app.delete("/products/{pid}")
 def delete_product(pid: str):
@@ -409,20 +487,66 @@ def confirm_order(oid: str):
             prod.qty = max(0, prod.qty - 1)
             prod.available = prod.qty > 0 and prod.available
         order.status = "confirmed"
+        order.confirmed_at = datetime.utcnow().isoformat()
         db.flush()
-        return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items])
+        return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items], created_at=order.created_at, confirmed_at=order.confirmed_at, removed_items=order.removed_items)
 
-# Optional: list orders for owner inbox
-@app.get("/orders", response_model=List[OrderOut])
-def list_orders(status: Optional[str] = None):
+class OrdersListOut(BaseModel):
+    items: List[OrderOut]
+    total: Optional[int] = None
+    next_offset: Optional[int] = None
+
+# Optional: list orders for owner inbox (with pagination)
+@app.get("/orders", response_model=OrdersListOut)
+def list_orders(status: Optional[str] = None, limit: int = 100, offset: int = 0):
     with session_scope() as db:
         qry = db.query(Order)
         if status:
             qry = qry.filter(Order.status == status)
+        total = qry.count()
+        page = qry.order_by(Order.created_at.desc()).offset(max(0,int(offset))).limit(max(0,int(limit))).all()
         out: List[OrderOut] = []
-        for o in qry.order_by(Order.created_at.desc()).all():
-            out.append(OrderOut(id=o.id, status=o.status, customer_phone=o.customer_phone, items=[i.product_id for i in o.items]))
-        return out
+        for o in page:
+            out.append(OrderOut(id=o.id, status=o.status, customer_phone=o.customer_phone, items=[i.product_id for i in o.items], created_at=o.created_at, confirmed_at=o.confirmed_at, removed_items=o.removed_items))
+        next_offset = (offset + limit) if (offset + limit) < total else None
+        return {"items": out, "total": total, "next_offset": next_offset}
+
+@app.patch("/orders/{oid}/remove_item", response_model=OrderOut)
+def remove_order_item(oid: str, pid: str = Body(..., embed=True)):
+    with session_scope() as db:
+        order: Order = db.get(Order, oid)
+        if not order:
+            raise HTTPException(404, "Order not found")
+        # remove item association
+        order.items = [i for i in order.items if i.product_id != pid]
+        # track removed list
+        removed = set(order.removed_items or [])
+        removed.add(pid)
+        order.removed_items = list(removed)
+        db.flush()
+        return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items], created_at=order.created_at, confirmed_at=order.confirmed_at, removed_items=order.removed_items)
+
+@app.patch("/orders/{oid}/add_item", response_model=OrderOut)
+def add_order_item(oid: str, pid: str = Body(..., embed=True)):
+    with session_scope() as db:
+        order: Order = db.get(Order, oid)
+        if not order:
+            raise HTTPException(404, "Order not found")
+        # validate product exists
+        prod: Product = db.get(Product, pid)
+        if not prod:
+            raise HTTPException(400, f"Product not found: {pid}")
+        # add back only if not already present
+        existing_ids = {i.product_id for i in order.items}
+        if pid not in existing_ids:
+            db.add(OrderItem(order=order, product_id=pid, qty=1))
+        # remove from removed list if present
+        removed = set(order.removed_items or [])
+        if pid in removed:
+            removed.remove(pid)
+            order.removed_items = list(removed)
+        db.flush()
+        return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items], created_at=order.created_at, confirmed_at=order.confirmed_at, removed_items=order.removed_items)
 
 # ----- Notes -----
 # • For Lambda deploy, add:
