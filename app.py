@@ -104,6 +104,7 @@ class Product(Base):
     qty = Column(Integer, nullable=False, default=0)
     available = Column(Boolean, nullable=False, default=True)
     images = Column(JSON, nullable=False, default=list)  # [url, ...]
+    images_small = Column(JSON, nullable=True, default=list)
     created_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
     updated_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
 
@@ -135,13 +136,15 @@ class OrderItem(Base):
 # For production, prefer Alembic migrations instead.
 Base.metadata.create_all(engine)
 
-# Lightweight schema patch for SQLite: add columns if missing
+# Lightweight schema patch for SQLite: add columns if missing, ensure helpful indexes
 try:
     with engine.connect() as conn:
         # Products: add cost_in_paise if missing
         cols_products = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(products)").fetchall()}
         if "cost_in_paise" not in cols_products:
             conn.exec_driver_sql("ALTER TABLE products ADD COLUMN cost_in_paise INTEGER DEFAULT 0")
+        if "images_small" not in cols_products:
+            conn.exec_driver_sql("ALTER TABLE products ADD COLUMN images_small JSON")
 
         # Orders: add confirmed_at and removed_items if missing
         cols_orders = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(orders)").fetchall()}
@@ -150,8 +153,45 @@ try:
         if "removed_items" not in cols_orders:
             # JSON resolves to TEXT on SQLite; default to empty array
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN removed_items JSON DEFAULT '[]'")
+
+        # Helpful indexes for common filters/sorts (SQLite IF NOT EXISTS support)
+        try:
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_products_created_at ON products(created_at)")
+        except Exception:
+            pass
+        try:
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)")
+        except Exception:
+            pass
+        try:
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_products_available_qty ON products(available, qty)")
+        except Exception:
+            pass
 except Exception as _e:
     LOGGER.warning("Schema patch skipped/failure: %s", _e)
+
+# ---- Image utilities (optional Pillow) ----
+def _make_thumbnail_dataurl(data_url: str, max_size=(640, 640), quality=70) -> str:
+    try:
+        if not (data_url or "").startswith("data:image"):
+            return data_url
+        import base64, io
+        from PIL import Image
+        head, b64 = data_url.split(",", 1)
+        raw = base64.b64decode(b64)
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        im.thumbnail(max_size, Image.LANCZOS)
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=quality, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(out.getvalue()).decode("ascii")
+    except Exception:
+        return data_url
+
+def make_thumbnails(urls):
+    try:
+        return [_make_thumbnail_dataurl(u) for u in (urls or [])]
+    except Exception:
+        return urls or []
 
 @contextmanager
 def session_scope():
@@ -316,6 +356,7 @@ def list_products(
     only_available: bool = False,
     limit: int = 100,
     offset: int = 0,
+    img_first: bool = False,
 ):
     with session_scope() as db:
         qry = db.query(Product)
@@ -337,22 +378,38 @@ def list_products(
             .limit(max(0, int(limit)))
             .all()
         )
-        items = [
-            ProductOut(
-                id=p.id,
-                title=p.title,
-                description=p.description,
-                category=p.category,
-                price=p.price_in_paise // 100,
-                cost=(getattr(p, 'cost_in_paise', 0) or 0) // 100,
-                qty=p.qty,
-                available=p.available,
-                images=p.images or [],
+        items = []
+        for p in page:
+            imgs = (p.images_small or []) or (p.images or [])
+            if img_first and isinstance(imgs, list) and len(imgs) > 1:
+                imgs = [imgs[0]]
+            items.append(
+                ProductOut(
+                    id=p.id,
+                    title=p.title,
+                    description=p.description,
+                    category=p.category,
+                    price=p.price_in_paise // 100,
+                    cost=(getattr(p, 'cost_in_paise', 0) or 0) // 100,
+                    qty=p.qty,
+                    available=p.available,
+                    images=imgs,
+                )
             )
-            for p in page
-        ]
         next_offset = (offset + limit) if (offset + limit) < total else None
         return {"items": items, "total": total, "next_offset": next_offset}
+
+@app.get("/products/{pid}/images")
+def get_product_images(pid: str):
+    """Return all images for a product (used for lazy loading in Shop).
+
+    Keeps list payloads smaller by allowing Shop to fetch full image arrays on demand.
+    """
+    with session_scope() as db:
+        m: Product = db.get(Product, pid)
+        if not m:
+            raise HTTPException(404, "Product not found")
+        return {"images": m.images or []}
 
 @app.get("/owner/products", response_model=ProductListOut)
 def list_products_owner(
@@ -385,8 +442,10 @@ def list_products_owner(
             .limit(max(0, int(limit)))
             .all()
         )
-        items = [
-            ProductOut(
+        items = []
+        for p in page:
+            imgs = (p.images_small or []) or (p.images or [])
+            items.append(ProductOut(
                 id=p.id,
                 title=p.title,
                 description=p.description,
@@ -395,10 +454,8 @@ def list_products_owner(
                 cost=(getattr(p, 'cost_in_paise', 0) or 0) // 100,
                 qty=p.qty,
                 available=p.available,
-                images=p.images or [],
-            )
-            for p in page
-        ]
+                images=imgs,
+            ))
         next_offset = (offset + limit) if (offset + limit) < total else None
         return {"items": items, "total": total, "next_offset": next_offset}
 
@@ -408,6 +465,7 @@ def create_product(p: ProductIn):
         LOGGER.info("Create product: id=%s, title=%s, cat=%s, images=%d", p.id, p.title, p.category, len(p.images or []))
         if db.get(Product, p.id):
             raise HTTPException(409, "Product ID already exists")
+        thumbs = make_thumbnails(p.images)
         m = Product(
             id=p.id,
             title=p.title,
@@ -418,6 +476,7 @@ def create_product(p: ProductIn):
             qty=p.qty,
             available=p.available and p.qty > 0,
             images=p.images,
+            images_small=thumbs,
         )
         db.add(m)
         db.flush()
@@ -438,6 +497,10 @@ def update_product(pid: str, p: ProductIn):
         m.qty = p.qty
         m.available = p.available and p.qty > 0
         m.images = p.images
+        try:
+            m.images_small = make_thumbnails(p.images)
+        except Exception:
+            pass
         db.flush()
         return ProductOut(id=m.id, title=m.title, description=m.description, category=m.category, price=m.price_in_paise // 100, cost=(m.cost_in_paise or 0)//100, qty=m.qty, available=m.available, images=m.images or [])
 
