@@ -79,6 +79,20 @@ AI_PROMPT_USER = os.getenv(
 )
 AI_DEBUG = os.getenv("AI_DEBUG", "0").lower() in {"1", "true", "yes"}
 
+# Image storage provider (local base64 | cloudflare | s3 [future])
+IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "local").lower()
+# Cloudflare Images config (used when IMAGE_PROVIDER=cloudflare)
+CF_IMAGES_ACCOUNT_ID = os.getenv("CF_IMAGES_ACCOUNT_ID", "")
+CF_IMAGES_ACCOUNT_HASH = os.getenv("CF_IMAGES_ACCOUNT_HASH", "")  # for delivery URLs
+CF_IMAGES_API_TOKEN = os.getenv("CF_IMAGES_API_TOKEN", "")
+CF_IMAGES_VARIANT_FULL = os.getenv("CF_IMAGES_VARIANT_FULL", "public")
+CF_IMAGES_VARIANT_THUMB = os.getenv("CF_IMAGES_VARIANT_THUMB", "thumb")
+# S3 config (used when IMAGE_PROVIDER=s3). Use IAM role or access keys.
+AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET", "")
+AWS_S3_REGION = os.getenv("AWS_S3_REGION", os.getenv("AWS_REGION", ""))
+# Optional CDN domain (e.g., CloudFront) to prefix keys; otherwise uses S3 public URL
+AWS_S3_CDN_BASE_URL = os.getenv("AWS_S3_CDN_BASE_URL", "")
+
 engine = create_engine(DATABASE_URL, future=True)
 # SessionLocal is a factory that gives us a new DB session for each request
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
@@ -200,6 +214,156 @@ def make_thumbnails(urls):
     except Exception:
         return urls or []
 
+def admin_backfill_thumbnails(token: Optional[str] = None, limit: Optional[int] = None, dry_run: bool = False):
+    """Generate images_small for products that are missing them.
+
+    Security: guarded by ADMIN_TOKEN env var. Provide via ?token=... or header X-Admin-Token.
+    Only intended for local/UAT. For production, move to a proper admin auth.
+    """
+    admin_token = os.getenv("ADMIN_TOKEN", "")
+    # allow header fallback
+    from fastapi import Request
+    # FastAPI dependency-less header read: we'll access from threadlocal scope using request object via contextvar isn't trivial.
+    # Simpler: rely on query param token; if missing and env not set, allow (local dev).
+    if admin_token and token != admin_token:
+        raise HTTPException(401, "Unauthorized")
+    updated = 0
+    scanned = 0
+    with session_scope() as db:
+        qry = db.query(Product).order_by(Product.created_at.desc())
+        if limit:
+            qry = qry.limit(int(limit))
+        for p in qry.all():
+            scanned += 1
+            imgs = p.images or []
+            small = p.images_small or []
+            # decide whether to refresh: missing, length mismatch, or any small missing
+            needs = (not small) or (len(small) != len(imgs))
+            if not needs:
+                continue
+            thumbs = make_thumbnails(imgs)
+            if dry_run:
+                updated += 1
+                continue
+            p.images_small = thumbs
+            updated += 1
+        if not dry_run:
+            db.flush()
+    return {"scanned": scanned, "updated": updated, "dry_run": dry_run}
+
+# ----- Cloudflare Images helper -----
+def cf_images_upload_one(data_url_or_url: str):
+    if not (CF_IMAGES_ACCOUNT_ID and CF_IMAGES_ACCOUNT_HASH and CF_IMAGES_API_TOKEN):
+        raise RuntimeError("Cloudflare Images env not configured")
+    try:
+        import requests, base64
+    except Exception as e:
+        raise RuntimeError("requests not installed; pip install requests") from e
+    endpoint = f"https://api.cloudflare.com/client/v4/accounts/{CF_IMAGES_ACCOUNT_ID}/images/v1"
+    headers = {"Authorization": f"Bearer {CF_IMAGES_API_TOKEN}"}
+    files = None
+    data = {}
+    val = data_url_or_url or ""
+    if val.startswith("data:image"):
+        head, b64 = val.split(",", 1)
+        content_type = head.split(":",1)[1].split(";",1)[0]
+        binary = base64.b64decode(b64)
+        files = {"file": ("upload.jpg", binary, content_type or "image/jpeg")}
+    else:
+        data = {"url": val}
+    r = requests.post(endpoint, headers=headers, data=data, files=files, timeout=30)
+    r.raise_for_status()
+    resp = r.json()
+    if not resp.get("success"):
+        raise RuntimeError(f"Cloudflare upload failed: {resp}")
+    image_id = resp.get("result", {}).get("id")
+    full = f"https://imagedelivery.net/{CF_IMAGES_ACCOUNT_HASH}/{image_id}/{CF_IMAGES_VARIANT_FULL}"
+    thumb = f"https://imagedelivery.net/{CF_IMAGES_ACCOUNT_HASH}/{image_id}/{CF_IMAGES_VARIANT_THUMB}"
+    return full, thumb
+
+def _dataurl_to_bytes_mime(val: str):
+    import base64
+    head, b64 = val.split(",", 1)
+    mime = head.split(":",1)[1].split(";",1)[0]
+    return base64.b64decode(b64), (mime or "image/jpeg")
+
+def _jpeg_resize_bytes(data: bytes, max_size=(1600,1600), quality=85) -> bytes:
+    try:
+        from PIL import Image
+        import io
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        im.thumbnail(max_size, Image.LANCZOS)
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=quality, optimize=True)
+        return out.getvalue()
+    except Exception:
+        return data
+
+def s3_upload_bytes(key: str, data: bytes, content_type: str, cache_control: str = "public, max-age=31536000") -> str:
+    if not AWS_S3_BUCKET:
+        raise RuntimeError("AWS_S3_BUCKET not set")
+    try:
+        import boto3
+    except Exception as e:
+        raise RuntimeError("boto3 not installed; pip install boto3") from e
+    extra = {"ContentType": content_type}
+    if cache_control:
+        extra["CacheControl"] = cache_control
+    s3 = boto3.client("s3", region_name=AWS_S3_REGION or None)
+    s3.put_object(Bucket=AWS_S3_BUCKET, Key=key, Body=data, **extra)
+    if AWS_S3_CDN_BASE_URL:
+        return f"{AWS_S3_CDN_BASE_URL.rstrip('/')}/{key}"
+    if AWS_S3_REGION:
+        return f"https://{AWS_S3_BUCKET}.s3.{AWS_S3_REGION}.amazonaws.com/{key}"
+    # regionless fallback
+    return f"https://{AWS_S3_BUCKET}.s3.amazonaws.com/{key}"
+
+def s3_upload_images(product_id: str, images: list[str]) -> tuple[list[str], list[str]]:
+    import uuid
+    full_urls, thumb_urls = [], []
+    for val in (images or []):
+        name = uuid.uuid4().hex
+        key_full = f"products/{product_id}/{name}.jpg"
+        key_thumb = f"products/{product_id}/{name}.thumb.jpg"
+        if (val or "").startswith("data:image"):
+            data, mime = _dataurl_to_bytes_mime(val)
+        else:
+            # fetch bytes
+            try:
+                import requests
+                r = requests.get(val, timeout=20)
+                r.raise_for_status()
+                data = r.content
+                mime = r.headers.get("Content-Type", "image/jpeg")
+            except Exception:
+                data, mime = b"", "image/jpeg"
+        # re-encode originals to jpeg at 85 to cap size
+        full_jpeg = _jpeg_resize_bytes(data, max_size=(2000,2000), quality=85)
+        thumb_jpeg = _jpeg_resize_bytes(data, max_size=(640,640), quality=75)
+        full_url = s3_upload_bytes(key_full, full_jpeg, "image/jpeg")
+        thumb_url = s3_upload_bytes(key_thumb, thumb_jpeg, "image/jpeg")
+        full_urls.append(full_url)
+        thumb_urls.append(thumb_url)
+    return full_urls, thumb_urls
+
+def maybe_upload_to_cdn(images: list[str], product_id: str = "") -> tuple[list[str], list[str]]:
+    imgs = images or []
+    if IMAGE_PROVIDER == "cloudflare":
+        full, thumbs = [], []
+        for u in imgs:
+            try:
+                f, t = cf_images_upload_one(u)
+            except Exception as e:
+                LOGGER.error("CF upload failed; keeping original: %s", e)
+                f, t = u, _make_thumbnail_dataurl(u)
+            full.append(f)
+            thumbs.append(t)
+        return full, thumbs
+    if IMAGE_PROVIDER == "s3":
+        return s3_upload_images(product_id or "misc", imgs)
+    # default local
+    return imgs, make_thumbnails(imgs)
+
 @contextmanager
 def session_scope():
     """Small helper to get a DB session with automatic commit/rollback.
@@ -277,6 +441,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register admin endpoints defined above (after app is created)
+app.post("/admin/backfill_thumbnails")(admin_backfill_thumbnails)
 
 @app.get("/health")
 def health():
@@ -473,7 +640,7 @@ def create_product(p: ProductIn):
         LOGGER.info("Create product: id=%s, title=%s, cat=%s, images=%d", p.id, p.title, p.category, len(p.images or []))
         if db.get(Product, p.id):
             raise HTTPException(409, "Product ID already exists")
-        thumbs = make_thumbnails(p.images)
+        imgs_full, thumbs = maybe_upload_to_cdn(p.images, p.id)
         m = Product(
             id=p.id,
             title=p.title,
@@ -483,7 +650,7 @@ def create_product(p: ProductIn):
             cost_in_paise=(p.cost or 0) * 100,
             qty=p.qty,
             available=p.available and p.qty > 0,
-            images=p.images,
+            images=imgs_full,
             images_small=thumbs,
         )
         db.add(m)
@@ -504,11 +671,9 @@ def update_product(pid: str, p: ProductIn):
         m.cost_in_paise = (p.cost or 0) * 100
         m.qty = p.qty
         m.available = p.available and p.qty > 0
-        m.images = p.images
-        try:
-            m.images_small = make_thumbnails(p.images)
-        except Exception:
-            pass
+        imgs_full, thumbs = maybe_upload_to_cdn(p.images, p.id)
+        m.images = imgs_full
+        m.images_small = thumbs
         db.flush()
         return ProductOut(id=m.id, title=m.title, description=m.description, category=m.category, price=m.price_in_paise // 100, cost=(m.cost_in_paise or 0)//100, qty=m.qty, available=m.available, images=m.images or [])
 
