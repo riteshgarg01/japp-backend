@@ -120,6 +120,7 @@ class Order(Base):
     created_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
     confirmed_at = Column(String, nullable=True)
     removed_items = Column(JSON, nullable=False, default=list)
+    session_id = Column(String, nullable=True)
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
 
 class OrderItem(Base):
@@ -153,6 +154,8 @@ try:
         if "removed_items" not in cols_orders:
             # JSON resolves to TEXT on SQLite; default to empty array
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN removed_items JSON DEFAULT '[]'")
+        if "session_id" not in cols_orders:
+            conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN session_id TEXT")
 
         # Helpful indexes for common filters/sorts (SQLite IF NOT EXISTS support)
         try:
@@ -165,6 +168,10 @@ try:
             pass
         try:
             conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_products_available_qty ON products(available, qty)")
+        except Exception:
+            pass
+        try:
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_orders_session_created ON orders(session_id, created_at)")
         except Exception:
             pass
 except Exception as _e:
@@ -237,6 +244,7 @@ class ProductListOut(BaseModel):
 class OrderCreate(BaseModel):
     items: List[str]  # product IDs; fixed quantity = 1 per item
     customer_phone: str
+    session_id: Optional[str] = None
 
 class OrderOut(BaseModel):
     id: str; status: str; customer_phone: str; items: List[str]
@@ -523,7 +531,7 @@ def create_order(req: OrderCreate):
     with session_scope() as db:
         # Create order with fixed qty=1 per item
         oid = f"ORD-{uuid.uuid4().hex[:8]}"
-        order = Order(id=oid, customer_phone=req.customer_phone, status="pending")
+        order = Order(id=oid, customer_phone=req.customer_phone, status="pending", session_id=req.session_id)
         db.add(order)
         for pid in req.items:
             # validate product exists
@@ -533,6 +541,21 @@ def create_order(req: OrderCreate):
             db.add(OrderItem(order=order, product_id=pid, qty=1))
         db.flush()
         return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items])
+
+class OrdersBySessionOut(BaseModel):
+    items: List[OrderOut]
+
+@app.get("/orders/by_session", response_model=OrdersBySessionOut)
+def orders_by_session(session_id: str, limit: int = 1):
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+    with session_scope() as db:
+        qry = db.query(Order).filter(Order.session_id == session_id)
+        page = qry.order_by(Order.created_at.desc()).limit(max(1, int(limit))).all()
+        out: List[OrderOut] = []
+        for o in page:
+            out.append(OrderOut(id=o.id, status=o.status, customer_phone=o.customer_phone, items=[i.product_id for i in o.items], created_at=o.created_at, confirmed_at=o.confirmed_at, removed_items=o.removed_items))
+        return {"items": out}
 
 @app.patch("/orders/{oid}/confirm", response_model=OrderOut)
 def confirm_order(oid: str):
