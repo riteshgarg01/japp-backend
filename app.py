@@ -26,7 +26,7 @@ load_dotenv()
 # (print-style logging often doesn't appear when running behind Uvicorn/Gunicorn)
 LOGGER = logging.getLogger("uvicorn.error")
 
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, String, Integer, Boolean, JSON, text, ForeignKey
@@ -58,6 +58,7 @@ ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",
 # Owner / brand config served to frontend
 OWNER_PHONE = os.getenv("OWNER_PHONE", "+919999999999")
 BRAND_NAME = os.getenv("BRAND_NAME", "Arohi's collection")
+LOGO_URL = os.getenv("LOGO_URL", "")
 # AI config
 # Model and prompts used by the /ai/describe endpoint. You can tweak these
 # in .env without changing code.
@@ -78,6 +79,7 @@ AI_PROMPT_USER = os.getenv(
     ),
 )
 AI_DEBUG = os.getenv("AI_DEBUG", "0").lower() in {"1", "true", "yes"}
+OBS_LOG_TIMING = os.getenv("OBS_LOG_TIMING", "1").lower() in {"1","true","yes"}
 
 # Image storage provider (local base64 | cloudflare | s3 [future])
 IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "local").lower()
@@ -214,19 +216,25 @@ def make_thumbnails(urls):
     except Exception:
         return urls or []
 
-def admin_backfill_thumbnails(token: Optional[str] = None, limit: Optional[int] = None, dry_run: bool = False):
+def admin_backfill_thumbnails(request: Request, token: Optional[str] = None, limit: Optional[int] = None, dry_run: bool = False):
     """Generate images_small for products that are missing them.
 
     Security: guarded by ADMIN_TOKEN env var. Provide via ?token=... or header X-Admin-Token.
     Only intended for local/UAT. For production, move to a proper admin auth.
     """
-    admin_token = os.getenv("ADMIN_TOKEN", "")
-    # allow header fallback
-    from fastapi import Request
-    # FastAPI dependency-less header read: we'll access from threadlocal scope using request object via contextvar isn't trivial.
-    # Simpler: rely on query param token; if missing and env not set, allow (local dev).
-    if admin_token and token != admin_token:
-        raise HTTPException(401, "Unauthorized")
+    admin_token = (os.getenv("ADMIN_TOKEN", "") or "").strip()
+    provided = (token or "").strip()
+    # Support Authorization: Bearer <token> and X-Admin-Token
+    if not provided:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            provided = auth.split(" ", 1)[1].strip()
+    if not provided:
+        provided = request.headers.get("X-Admin-Token", "").strip()
+    # Enforce only if ADMIN_TOKEN is set
+    if admin_token:
+        if not provided or provided != admin_token:
+            raise HTTPException(401, "Unauthorized: invalid or missing admin token")
     updated = 0
     scanned = 0
     with session_scope() as db:
@@ -445,6 +453,40 @@ app.add_middleware(
 # Register admin endpoints defined above (after app is created)
 app.post("/admin/backfill_thumbnails")(admin_backfill_thumbnails)
 
+if OBS_LOG_TIMING:
+    @app.middleware("http")
+    async def _timing_mw(request: Request, call_next):
+        import time
+        t0 = time.perf_counter()
+        resp = await call_next(request)
+        dt_ms = int((time.perf_counter() - t0) * 1000)
+        try:
+            LOGGER.info("%s %s -> %s %dms", request.method, request.url.path, getattr(resp, "status_code", "?"), dt_ms)
+        except Exception:
+            pass
+        return resp
+
+# ---- Admin auth helper ----
+def _extract_admin_token(request: Request, token_query: Optional[str] = None) -> str:
+    provided = (token_query or "").strip()
+    if not provided:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            provided = auth.split(" ", 1)[1].strip()
+    if not provided:
+        provided = request.headers.get("X-Admin-Token", "").strip()
+    if not provided:
+        provided = request.query_params.get("token", "").strip()
+    return provided
+
+def require_admin(request: Request, token_query: Optional[str] = None):
+    admin_token = (os.getenv("ADMIN_TOKEN", "") or "").strip()
+    if not admin_token:
+        return  # open in local/dev when no token configured
+    provided = _extract_admin_token(request, token_query)
+    if not provided or provided != admin_token:
+        raise HTTPException(401, "Unauthorized: invalid or missing admin token")
+
 @app.get("/health")
 def health():
     return {"ok": True, "db": DATABASE_URL}
@@ -456,7 +498,7 @@ def get_config():
     Returning this from the backend avoids hard-coding owner phone/brand
     inside the frontend bundle.
     """
-    return {"owner_phone": OWNER_PHONE, "brand_name": BRAND_NAME}
+    return {"owner_phone": OWNER_PHONE, "brand_name": BRAND_NAME, "logo_url": LOGO_URL}
 
 # ---- S3 presign (PUT) ----
 # ---- AI describe (server calls OpenAI Vision) ----
@@ -588,6 +630,7 @@ def get_product_images(pid: str):
 
 @app.get("/owner/products", response_model=ProductListOut)
 def list_products_owner(
+    request: Request,
     category: Optional[str] = None,
     q: Optional[str] = None,
     min_price: Optional[int] = None,
@@ -596,6 +639,7 @@ def list_products_owner(
     limit: int = 100,
     offset: int = 0,
 ):
+    require_admin(request)
     # Same as public listing but includes cost in response
     with session_scope() as db:
         qry = db.query(Product)
@@ -635,7 +679,8 @@ def list_products_owner(
         return {"items": items, "total": total, "next_offset": next_offset}
 
 @app.post("/products", response_model=ProductOut)
-def create_product(p: ProductIn):
+def create_product(request: Request, p: ProductIn):
+    require_admin(request)
     with session_scope() as db:
         LOGGER.info("Create product: id=%s, title=%s, cat=%s, images=%d", p.id, p.title, p.category, len(p.images or []))
         if db.get(Product, p.id):
@@ -658,7 +703,8 @@ def create_product(p: ProductIn):
         return ProductOut(id=m.id, title=m.title, description=m.description, category=m.category, price=m.price_in_paise // 100, cost=(m.cost_in_paise or 0)//100, qty=m.qty, available=m.available, images=m.images or [])
 
 @app.patch("/products/{pid}", response_model=ProductOut)
-def update_product(pid: str, p: ProductIn):
+def update_product(request: Request, pid: str, p: ProductIn):
+    require_admin(request)
     with session_scope() as db:
         LOGGER.info("Update product: id=%s, title=%s, cat=%s, images=%d", pid, p.title, p.category, len(p.images or []))
         m: Product = db.get(Product, pid)
@@ -678,7 +724,8 @@ def update_product(pid: str, p: ProductIn):
         return ProductOut(id=m.id, title=m.title, description=m.description, category=m.category, price=m.price_in_paise // 100, cost=(m.cost_in_paise or 0)//100, qty=m.qty, available=m.available, images=m.images or [])
 
 @app.delete("/products/{pid}")
-def delete_product(pid: str):
+def delete_product(request: Request, pid: str):
+    require_admin(request)
     with session_scope() as db:
         m = db.get(Product, pid)
         if not m:
@@ -723,7 +770,8 @@ def orders_by_session(session_id: str, limit: int = 1):
         return {"items": out}
 
 @app.patch("/orders/{oid}/confirm", response_model=OrderOut)
-def confirm_order(oid: str):
+def confirm_order(request: Request, oid: str):
+    require_admin(request)
     with session_scope() as db:
         order: Order = db.get(Order, oid)
         if not order:
@@ -749,7 +797,8 @@ class OrdersListOut(BaseModel):
 
 # Optional: list orders for owner inbox (with pagination)
 @app.get("/orders", response_model=OrdersListOut)
-def list_orders(status: Optional[str] = None, limit: int = 100, offset: int = 0):
+def list_orders(request: Request, status: Optional[str] = None, limit: int = 100, offset: int = 0):
+    require_admin(request)
     with session_scope() as db:
         qry = db.query(Order)
         if status:
@@ -763,7 +812,8 @@ def list_orders(status: Optional[str] = None, limit: int = 100, offset: int = 0)
         return {"items": out, "total": total, "next_offset": next_offset}
 
 @app.patch("/orders/{oid}/remove_item", response_model=OrderOut)
-def remove_order_item(oid: str, pid: str = Body(..., embed=True)):
+def remove_order_item(request: Request, oid: str, pid: str = Body(..., embed=True)):
+    require_admin(request)
     with session_scope() as db:
         order: Order = db.get(Order, oid)
         if not order:
@@ -778,7 +828,8 @@ def remove_order_item(oid: str, pid: str = Body(..., embed=True)):
         return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items], created_at=order.created_at, confirmed_at=order.confirmed_at, removed_items=order.removed_items)
 
 @app.patch("/orders/{oid}/add_item", response_model=OrderOut)
-def add_order_item(oid: str, pid: str = Body(..., embed=True)):
+def add_order_item(request: Request, oid: str, pid: str = Body(..., embed=True)):
+    require_admin(request)
     with session_scope() as db:
         order: Order = db.get(Order, oid)
         if not order:
