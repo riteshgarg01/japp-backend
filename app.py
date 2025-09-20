@@ -27,6 +27,8 @@ load_dotenv()
 LOGGER = logging.getLogger("uvicorn.error")
 
 from fastapi import FastAPI, HTTPException, Body, Request, Response
+from collections import defaultdict, deque
+import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, String, Integer, Boolean, JSON, text, ForeignKey
@@ -80,6 +82,35 @@ AI_PROMPT_USER = os.getenv(
 )
 AI_DEBUG = os.getenv("AI_DEBUG", "0").lower() in {"1", "true", "yes"}
 OBS_LOG_TIMING = os.getenv("OBS_LOG_TIMING", "1").lower() in {"1","true","yes"}
+
+# Robust env parsers (tolerate accidental inline comments like "700: warn for slow calls")
+def _int_env(name: str, default: int) -> int:
+    try:
+        raw = str(os.getenv(name, str(default)))
+        import re
+        m = re.search(r"\d+", raw)
+        return int(m.group(0)) if m else int(default)
+    except Exception:
+        return int(default)
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        raw = str(os.getenv(name, str(default)))
+        # take first token before space/colon
+        raw = raw.split()[0].split(":")[0]
+        return float(raw)
+    except Exception:
+        return float(default)
+
+OBS_SLOW_MS = _int_env("OBS_SLOW_MS", 700)
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
+SENTRY_TRACES = _float_env("SENTRY_TRACES", 0.0)
+OBS_WINDOW_SEC = _int_env("OBS_WINDOW_SEC", 300)  # 5 minutes
+RETAIN_EVENTS_DAYS = _int_env("RETAIN_EVENTS_DAYS", 30)
+RETAIN_REQ_STATS_DAYS = _int_env("RETAIN_REQ_STATS_DAYS", 7)
+
+# In-memory recent request timings per route (windowed)
+_REQ_STATS: dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
 
 # Image storage provider (local base64 | cloudflare | s3 [future])
 IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "local").lower()
@@ -149,6 +180,14 @@ class OrderItem(Base):
     order = relationship("Order", back_populates="items")
     product = relationship("Product")
 
+class Event(Base):
+    __tablename__ = "events"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String, index=True, nullable=True)
+    kind = Column(String, index=True, nullable=False)  # add_to_cart | remove_from_cart | send_order | confirm_order
+    payload = Column(JSON, nullable=True, default=dict)
+    created_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
+
 # Create tables automatically on startup for local dev (quick and simple).
 # For production, prefer Alembic migrations instead.
 Base.metadata.create_all(engine)
@@ -188,6 +227,20 @@ try:
             pass
         try:
             conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_orders_session_created ON orders(session_id, created_at)")
+        except Exception:
+            pass
+        # Create events table if missing
+        conn.exec_driver_sql("""
+        CREATE TABLE IF NOT EXISTS events (
+            id TEXT PRIMARY KEY,
+            session_id TEXT,
+            kind TEXT NOT NULL,
+            payload JSON,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        try:
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id)")
         except Exception:
             pass
 except Exception as _e:
@@ -461,7 +514,15 @@ if OBS_LOG_TIMING:
         resp = await call_next(request)
         dt_ms = int((time.perf_counter() - t0) * 1000)
         try:
-            LOGGER.info("%s %s -> %s %dms", request.method, request.url.path, getattr(resp, "status_code", "?"), dt_ms)
+            log_fn = LOGGER.warning if dt_ms >= OBS_SLOW_MS else LOGGER.info
+            log_fn("%s %s -> %s %dms", request.method, request.url.path, getattr(resp, "status_code", "?"), dt_ms)
+            # record to in-memory stats (window OBS_WINDOW_SEC)
+            now = time.time()
+            dq = _REQ_STATS[request.url.path]
+            dq.append((now, dt_ms))
+            # trim by time window
+            while dq and (now - dq[0][0]) > OBS_WINDOW_SEC:
+                dq.popleft()
         except Exception:
             pass
         return resp
@@ -487,6 +548,163 @@ def require_admin(request: Request, token_query: Optional[str] = None):
     if not provided or provided != admin_token:
         raise HTTPException(401, "Unauthorized: invalid or missing admin token")
 
+# Optional Sentry SDK (errors + traces)
+try:
+    if SENTRY_DSN:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        sentry_sdk.init(dsn=SENTRY_DSN, integrations=[FastApiIntegration()], traces_sample_rate=SENTRY_TRACES)
+        LOGGER.info("Sentry initialized (traces=%s)", SENTRY_TRACES)
+except Exception as _e:
+    LOGGER.warning("Sentry init failed: %s", _e)
+
+@app.get("/health/obs")
+def health_obs():
+    # recent request stats
+    req = []
+    for path, dq in list(_REQ_STATS.items()):
+        if not dq:
+            continue
+        vals = [ms for _, ms in dq]
+        n = len(vals)
+        avg = sum(vals) / n
+        # p95
+        sv = sorted(vals)
+        import math
+        p95 = sv[max(0, min(n-1, math.ceil(0.95*n)-1))]
+        req.append({"path": path, "count": n, "avg_ms": round(avg, 1), "p95_ms": p95})
+    req.sort(key=lambda x: x["path"])  # stable order
+
+    # events in last 24h
+    events = {"total": 0}
+    try:
+        with engine.connect() as conn:
+            rows = conn.exec_driver_sql(
+                "SELECT kind, COUNT(*) FROM events WHERE created_at >= datetime('now','-24 hours') GROUP BY kind"
+            ).fetchall()
+            total = 0
+            for kind, cnt in rows:
+                events[str(kind)] = int(cnt)
+                total += int(cnt)
+            events["total"] = total
+    except Exception as e:
+        events = {"error": str(e)}
+
+    return {"ok": True, "window_sec": OBS_WINDOW_SEC, "requests": req, "events_24h": events}
+
+
+# ---- Long-term request stats (per-minute aggregates) ----
+# SQLite table to persist per-minute stats
+try:
+    with engine.connect() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS req_stats (
+              ts_min TEXT NOT NULL,
+              path   TEXT NOT NULL,
+              count  INTEGER NOT NULL,
+              avg_ms REAL NOT NULL,
+              p95_ms REAL NOT NULL,
+              PRIMARY KEY (ts_min, path)
+            )
+            """
+        )
+except Exception as _e:
+    LOGGER.warning("Failed to ensure req_stats table: %s", _e)
+
+
+async def _aggregate_stats_loop():
+    """Every minute, write per-minute aggregates into req_stats.
+
+    Aggregates are computed from the in-memory _REQ_STATS window for the past minute.
+    """
+    import time, math
+    while True:
+        try:
+            now = time.time()
+            # compute stats for the last full minute bucket
+            # use current minute (floor) as bucket timestamp
+            bucket_ts = int(now // 60 * 60)
+            rows = []
+            for path, dq in list(_REQ_STATS.items()):
+                # values in the last minute
+                vals = [ms for t, ms in dq if t >= bucket_ts]
+                if not vals:
+                    continue
+                n = len(vals)
+                avg = sum(vals) / n
+                sv = sorted(vals)
+                p95 = sv[max(0, min(n-1, math.ceil(0.95*n)-1))]
+                rows.append((bucket_ts, path, n, round(avg,1), p95))
+            if rows:
+                # write into SQLite
+                with engine.begin() as conn:
+                    for ts, path, cnt, avg_ms, p95_ms in rows:
+                        ts_min_iso = datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M:00')
+                        conn.exec_driver_sql(
+                            "INSERT OR REPLACE INTO req_stats (ts_min, path, count, avg_ms, p95_ms) VALUES (?,?,?,?,?)",
+                            (ts_min_iso, path, cnt, avg_ms, p95_ms),
+                        )
+        except Exception as e:
+            try:
+                LOGGER.warning("stats loop error: %s", e)
+            except Exception:
+                pass
+        # sleep until next minute boundary
+        now2 = time.time()
+        sleep_sec = max(5.0, 60.0 - (now2 % 60.0))
+        await asyncio.sleep(sleep_sec)
+
+
+@app.on_event("startup")
+async def _start_stats_loop():
+    try:
+        asyncio.create_task(_aggregate_stats_loop())
+        LOGGER.info("Started stats aggregation loop")
+    except Exception as e:
+        LOGGER.warning("Failed to start stats loop: %s", e)
+    # retention loop (every 6 hours)
+    async def _retention_loop():
+        import time
+        while True:
+            try:
+                with engine.begin() as conn:
+                    conn.exec_driver_sql(
+                        "DELETE FROM req_stats WHERE ts_min < datetime('now', ?)",
+                        (f"-{RETAIN_REQ_STATS_DAYS} days",),
+                    )
+                    conn.exec_driver_sql(
+                        "DELETE FROM events WHERE created_at < datetime('now', ?)",
+                        (f"-{RETAIN_EVENTS_DAYS} days",),
+                    )
+            except Exception as e:
+                try: LOGGER.warning("retention error: %s", e)
+                except Exception: pass
+            await asyncio.sleep(6*60*60)
+    try:
+        asyncio.create_task(_retention_loop())
+        LOGGER.info("Started retention loop")
+    except Exception as e:
+        LOGGER.warning("Failed to start retention loop: %s", e)
+
+
+@app.get("/health/obs/history")
+def health_obs_history(limit_minutes: int = 60):
+    """Return last N minutes of per-minute aggregates from req_stats."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.exec_driver_sql(
+                "SELECT ts_min, path, count, avg_ms, p95_ms FROM req_stats ORDER BY ts_min DESC, path ASC LIMIT ?",
+                (limit_minutes * 20,),  # rough cap, multiple paths per minute
+            ).fetchall()
+            out = [
+                {"ts_min": r[0], "path": r[1], "count": r[2], "avg_ms": r[3], "p95_ms": r[4]}
+                for r in rows
+            ]
+            return {"ok": True, "rows": out}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.get("/health")
 def health():
     return {"ok": True, "db": DATABASE_URL}
@@ -502,6 +720,52 @@ def get_config():
 
 # ---- S3 presign (PUT) ----
 # ---- AI describe (server calls OpenAI Vision) ----
+
+# ---- Analytics ----
+class EventIn(BaseModel):
+    session_id: Optional[str] = None
+    kind: str
+    payload: Optional[dict] = None
+
+@app.post("/events")
+def create_event(e: EventIn):
+    # Simple validation
+    if not e.kind:
+        raise HTTPException(400, "kind required")
+    with session_scope() as db:
+        ev = Event(session_id=e.session_id, kind=e.kind, payload=e.payload or {})
+        db.add(ev)
+        db.flush()
+        try:
+            LOGGER.info("event: kind=%s session=%s", e.kind, (e.session_id or ""))
+        except Exception:
+            pass
+        return {"ok": True, "id": ev.id}
+
+# ---- Admin event debug ----
+@app.get("/admin/events/recent")
+def admin_events_recent(request: Request, limit: int = 50):
+    require_admin(request)
+    with engine.connect() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT created_at, session_id, kind, payload FROM events ORDER BY created_at DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    items = [
+        {"created_at": r[0], "session_id": r[1], "kind": r[2], "payload": r[3]}
+        for r in rows
+    ]
+    return {"ok": True, "items": items}
+
+@app.get("/admin/events/counts")
+def admin_events_counts(request: Request, hours: int = 24):
+    require_admin(request)
+    with engine.connect() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT kind, COUNT(*) FROM events WHERE created_at >= datetime('now', ?) GROUP BY kind",
+            (f"-{max(1,int(hours))} hours",),
+        ).fetchall()
+    return {"ok": True, "hours": hours, "counts": {str(k): int(c) for k,c in rows}}
 
 @app.post("/ai/describe", response_model=DescribeResponse)
 def ai_describe(req: DescribeRequest):
@@ -566,6 +830,8 @@ def ai_describe(req: DescribeRequest):
 # CRUD endpoints used by both Customer and Owner apps
 @app.get("/products", response_model=ProductListOut, response_model_exclude={"items": {"__all__": {"cost"}}})
 def list_products(
+    request: Request,
+    response: Response,
     category: Optional[str] = None,
     q: Optional[str] = None,
     min_price: Optional[int] = None,
@@ -614,6 +880,22 @@ def list_products(
                 )
             )
         next_offset = (offset + limit) if (offset + limit) < total else None
+        # ETag + simple cache header
+        import hashlib, json as _json
+        sig_src = _json.dumps({
+            'params': {'category': category, 'q': q, 'min': min_price, 'max': max_price,
+                       'only': only_available, 'limit': limit, 'offset': offset},
+            'items': [{'id': p.id, 'qty': p.qty, 'avail': p.available, 'price': p.price_in_paise} for p in page]
+        }, sort_keys=True).encode('utf-8')
+        etag = 'W/"' + hashlib.sha1(sig_src).hexdigest() + '"'
+        inm = request.headers.get('If-None-Match')
+        if inm == etag:
+            response.headers['ETag'] = etag
+            response.headers['X-Cache'] = 'HIT'
+            return Response(status_code=304)
+        response.headers['ETag'] = etag
+        response.headers['Cache-Control'] = 'public, max-age=60'
+        response.headers['X-Cache'] = 'MISS'
         return {"items": items, "total": total, "next_offset": next_offset}
 
 @app.get("/products/{pid}/images")
@@ -631,6 +913,7 @@ def get_product_images(pid: str):
 @app.get("/owner/products", response_model=ProductListOut)
 def list_products_owner(
     request: Request,
+    response: Response,
     category: Optional[str] = None,
     q: Optional[str] = None,
     min_price: Optional[int] = None,
@@ -676,6 +959,21 @@ def list_products_owner(
                 images=imgs,
             ))
         next_offset = (offset + limit) if (offset + limit) < total else None
+        import hashlib, json as _json
+        sig_src = _json.dumps({
+            'params': {'category': category, 'q': q, 'min': min_price, 'max': max_price,
+                       'only': only_available, 'limit': limit, 'offset': offset},
+            'items': [{'id': p.id, 'qty': p.qty, 'avail': p.available, 'price': p.price_in_paise} for p in page]
+        }, sort_keys=True).encode('utf-8')
+        etag = 'W/"' + hashlib.sha1(sig_src).hexdigest() + '"'
+        inm = request.headers.get('If-None-Match')
+        if inm == etag:
+            response.headers['ETag'] = etag
+            response.headers['X-Cache'] = 'HIT'
+            return Response(status_code=304)
+        response.headers['ETag'] = etag
+        response.headers['Cache-Control'] = 'private, max-age=60'
+        response.headers['X-Cache'] = 'MISS'
         return {"items": items, "total": total, "next_offset": next_offset}
 
 @app.post("/products", response_model=ProductOut)
@@ -717,9 +1015,23 @@ def update_product(request: Request, pid: str, p: ProductIn):
         m.cost_in_paise = (p.cost or 0) * 100
         m.qty = p.qty
         m.available = p.available and p.qty > 0
-        imgs_full, thumbs = maybe_upload_to_cdn(p.images, p.id)
-        m.images = imgs_full
-        m.images_small = thumbs
+        # If images are unchanged, avoid re-uploading or altering URLs
+        incoming_images = list(p.images or [])
+        try:
+            current_images = list(m.images or [])
+        except Exception:
+            current_images = []
+        if incoming_images and incoming_images == current_images:
+            # keep m.images and m.images_small as-is
+            LOGGER.info("Update product: images unchanged, skipping re-upload for %s", pid)
+        elif not incoming_images:
+            # nothing provided: preserve existing
+            LOGGER.info("Update product: no images provided, preserving existing for %s", pid)
+        else:
+            # New/changed images provided: process via provider (local/CF/S3)
+            imgs_full, thumbs = maybe_upload_to_cdn(incoming_images, p.id)
+            m.images = imgs_full
+            m.images_small = thumbs
         db.flush()
         return ProductOut(id=m.id, title=m.title, description=m.description, category=m.category, price=m.price_in_paise // 100, cost=(m.cost_in_paise or 0)//100, qty=m.qty, available=m.available, images=m.images or [])
 
@@ -782,7 +1094,8 @@ def confirm_order(request: Request, oid: str):
         for item in order.items:
             prod: Product = db.get(Product, item.product_id)
             if not prod or not prod.available or prod.qty <= 0:
-                raise HTTPException(409, f"Item not available: {item.product_id}")
+                reason = "not found" if not prod else ("not available" if not prod.available else "qty <= 0")
+                raise HTTPException(409, f"Item not confirmable: {item.product_id} ({reason})")
             prod.qty = max(0, prod.qty - 1)
             prod.available = prod.qty > 0 and prod.available
         order.status = "confirmed"
