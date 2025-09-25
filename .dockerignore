@@ -1,0 +1,17 @@
+# Keep local-only files out of the production image
+.env
+.env.*
+*.db
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.git/
+.gitignore
+README.md
+*.swp
+*.deb
+node_modules/
+tests/

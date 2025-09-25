@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+env/
+venv/
+
+# local db & uploads
+*.db
+*.sqlite
+uploads/
+aws
+awscliv2.zip
+*.zip
+
+# logs
+*.log
+
+# env
+.env
+.env.local
+.env.*
+!.env.example
+
+# OS/editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
