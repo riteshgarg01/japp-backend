@@ -1117,17 +1117,58 @@ def update_product(request: Request, pid: str, p: ProductIn):
             current_images = list(m.images or [])
         except Exception:
             current_images = []
-        if incoming_images and incoming_images == current_images:
-            # keep m.images and m.images_small as-is
+        try:
+            current_small = list(m.images_small or [])
+        except Exception:
+            current_small = []
+
+        if incoming_images and (
+            incoming_images == current_images or (
+                current_small and incoming_images == current_small
+            )
+        ):
             LOGGER.info("Update product: images unchanged, skipping re-upload for %s", pid)
         elif not incoming_images:
-            # nothing provided: preserve existing
             LOGGER.info("Update product: no images provided, preserving existing for %s", pid)
         else:
-            # New/changed images provided: process via provider (local/CF/S3)
-            imgs_full, thumbs = maybe_upload_to_cdn(incoming_images, p.id)
-            m.images = imgs_full
-            m.images_small = thumbs
+            # Preserve existing URLs (full + thumb) where possible, and only upload new ones
+            existing_map: dict[str, tuple[str, Optional[str]]] = {}
+            for idx, full_url in enumerate(current_images):
+                small_url = current_small[idx] if idx < len(current_small) else None
+                existing_map[full_url] = (full_url, small_url)
+            for idx, thumb_url in enumerate(current_small):
+                if thumb_url and idx < len(current_images):
+                    existing_map.setdefault(thumb_url, (current_images[idx], thumb_url))
+
+            new_payloads: list[str] = []
+            for val in incoming_images:
+                if val in existing_map:
+                    continue
+                new_payloads.append(val)
+
+            uploaded_full: list[str] = []
+            uploaded_thumbs: list[str] = []
+            if new_payloads:
+                uploaded_full, uploaded_thumbs = maybe_upload_to_cdn(new_payloads, p.id)
+            new_iter = iter(zip(uploaded_full, uploaded_thumbs))
+
+            out_full: list[str] = []
+            out_small: list[str] = []
+            for val in incoming_images:
+                if val in existing_map:
+                    full_url, thumb_url = existing_map[val]
+                    out_full.append(full_url)
+                    out_small.append(thumb_url or make_thumbnails([full_url])[0])
+                else:
+                    try:
+                        full_url, thumb_url = next(new_iter)
+                    except StopIteration:
+                        full_url, thumb_url = val, make_thumbnails([val])[0]
+                    out_full.append(full_url)
+                    out_small.append(thumb_url)
+
+            m.images = out_full
+            m.images_small = out_small
         db.flush()
         return ProductOut(
             id=m.id,
