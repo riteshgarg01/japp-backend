@@ -29,7 +29,7 @@ load_dotenv()
 # (print-style logging often doesn't appear when running behind Uvicorn/Gunicorn)
 LOGGER = logging.getLogger("uvicorn.error")
 
-from fastapi import FastAPI, HTTPException, Body, Request, Response
+from fastapi import FastAPI, HTTPException, Body, Request, Response, BackgroundTasks, status
 from collections import defaultdict, deque
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
@@ -189,6 +189,9 @@ class Product(Base):
     available = Column(Boolean, nullable=False, default=True)
     images = Column(JSON, nullable=False, default=list)  # [url, ...]
     images_small = Column(JSON, nullable=True, default=list)
+    status = Column(String, nullable=False, default="ready")  # ready | processing | failed
+    processing_error = Column(String, nullable=True)
+    pending_images = Column(JSON, nullable=True, default=list)
     created_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
     updated_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
 
@@ -240,6 +243,12 @@ try:
                 conn.exec_driver_sql("ALTER TABLE products ADD COLUMN cost_in_paise INTEGER DEFAULT 0")
             if "images_small" not in cols_products:
                 conn.exec_driver_sql("ALTER TABLE products ADD COLUMN images_small JSON")
+            if "status" not in cols_products:
+                conn.exec_driver_sql("ALTER TABLE products ADD COLUMN status TEXT DEFAULT 'ready'")
+            if "processing_error" not in cols_products:
+                conn.exec_driver_sql("ALTER TABLE products ADD COLUMN processing_error TEXT")
+            if "pending_images" not in cols_products:
+                conn.exec_driver_sql("ALTER TABLE products ADD COLUMN pending_images JSON")
 
             cols_orders = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(orders)").fetchall()}
             if "confirmed_at" not in cols_orders:
@@ -252,6 +261,9 @@ try:
             # Engines like Postgres support IF NOT EXISTS directly
             conn.exec_driver_sql("ALTER TABLE products ADD COLUMN IF NOT EXISTS cost_in_paise INTEGER DEFAULT 0")
             conn.exec_driver_sql("ALTER TABLE products ADD COLUMN IF NOT EXISTS images_small JSON")
+            conn.exec_driver_sql("ALTER TABLE products ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ready'")
+            conn.exec_driver_sql("ALTER TABLE products ADD COLUMN IF NOT EXISTS processing_error TEXT")
+            conn.exec_driver_sql("ALTER TABLE products ADD COLUMN IF NOT EXISTS pending_images JSON")
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN IF NOT EXISTS confirmed_at TEXT")
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN IF NOT EXISTS removed_items JSON DEFAULT '[]'::json")
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN IF NOT EXISTS session_id TEXT")
@@ -451,6 +463,12 @@ def s3_upload_images(product_id: str, images: list[str]) -> tuple[list[str], lis
                 mime = r.headers.get("Content-Type", "image/jpeg")
             except Exception:
                 data, mime = b"", "image/jpeg"
+        if not data:
+            LOGGER.warning("Skipping upload for product %s (no data for image source)", product_id)
+            full_urls.append(val)
+            thumb_candidate = _guess_thumb_url_from_full(val) or make_thumbnails([val])[0]
+            thumb_urls.append(thumb_candidate)
+            continue
         # re-encode originals to jpeg at 85 to cap size
         t_resize = time.perf_counter() if OBS_LOG_TIMING else None
         full_jpeg = _jpeg_resize_bytes(data, max_size=(2000,2000), quality=85)
@@ -492,6 +510,130 @@ def maybe_upload_to_cdn(images: list[str], product_id: str = "") -> tuple[list[s
     # default local
     return imgs, make_thumbnails(imgs)
 
+
+def _normalize_pending_images(raw: Optional[list]) -> list[dict[str, Optional[str]]]:
+    items: list[dict[str, Optional[str]]] = []
+    for item in list(raw or []):
+        if isinstance(item, dict):
+            src = item.get('src') or item.get('url') or item.get('image')
+            small = item.get('small') or item.get('thumb')
+        else:
+            src = item
+            small = None
+        if not src:
+            continue
+        items.append({'src': src, 'small': small})
+    return items
+
+
+def _guess_thumb_url_from_full(url: str) -> Optional[str]:
+    if not url:
+        return None
+    if url.endswith('.thumb.jpg') or url.endswith('.thumb.jpeg'):
+        return url
+    if url.startswith('http'):
+        base, sep, query = url.partition('?')
+        suffix = f'?{query}' if sep == '?' else ''
+        if base.endswith('.jpg'):
+            return f"{base[:-4]}.thumb.jpg{suffix}"
+        if base.endswith('.jpeg'):
+            return f"{base[:-5]}.thumb.jpeg{suffix}"
+    return None
+
+
+def _process_product_images_async(product_id: str, images: Optional[list] = None):
+    try:
+        with session_scope() as db:
+            prod: Product = db.get(Product, product_id)
+            if not prod:
+                return
+            pending_items = _normalize_pending_images(images if images is not None else prod.pending_images)
+            existing_full = list(prod.images or [])
+            existing_small = list(prod.images_small or [])
+            existing_lookup: dict[str, list[Optional[str]]] = {}
+            for idx, full_url in enumerate(existing_full):
+                if not full_url:
+                    continue
+                if isinstance(full_url, str) and full_url.startswith('data:image'):
+                    continue
+                thumb_url = existing_small[idx] if idx < len(existing_small) else None
+                existing_lookup.setdefault(full_url, []).append(thumb_url)
+        if not pending_items:
+            with session_scope() as db:
+                prod: Product = db.get(Product, product_id)
+                if not prod:
+                    return
+                prod.images = []
+                prod.images_small = []
+                prod.pending_images = []
+                prod.status = 'ready'
+                prod.processing_error = None
+            return
+
+        upload_sources: list[str] = []
+        for item in pending_items:
+            src = item['src']
+            if src and not src.startswith('data:image') and existing_lookup.get(src):
+                continue
+            if src and src.startswith('data:image'):
+                upload_sources.append(src)
+            else:
+                existing_lookup.setdefault(src, []).append(item.get('small'))
+
+        uploaded_full: list[str] = []
+        uploaded_thumbs: list[str] = []
+        if upload_sources:
+            t_img = time.perf_counter() if OBS_LOG_TIMING else None
+            uploaded_full, uploaded_thumbs = maybe_upload_to_cdn(upload_sources, product_id)
+            if t_img is not None:
+                LOGGER.info(
+                    'Products upload processed images=%d provider=%s latency=%.1fms',
+                    len(upload_sources),
+                    IMAGE_PROVIDER,
+                    (time.perf_counter() - t_img) * 1000.0,
+                )
+        upload_iter = iter(zip(uploaded_full, uploaded_thumbs))
+
+        final_full: list[str] = []
+        final_small: list[str] = []
+        for item in pending_items:
+            src = item['src']
+            small_hint = item.get('small')
+            if existing_lookup.get(src):
+                small_list = existing_lookup[src]
+                small_val = small_list.pop(0) if small_list else None
+                final_full.append(src)
+                final_small.append(
+                    small_val
+                    or small_hint
+                    or _guess_thumb_url_from_full(src)
+                    or make_thumbnails([src])[0]
+                )
+            else:
+                try:
+                    full_val, thumb_val = next(upload_iter)
+                except StopIteration:
+                    full_val = src
+                    thumb_val = make_thumbnails([src])[0]
+                final_full.append(full_val)
+                final_small.append(thumb_val)
+
+        with session_scope() as db:
+            prod: Product = db.get(Product, product_id)
+            if not prod:
+                return
+            prod.images = final_full
+            prod.images_small = final_small
+            prod.pending_images = []
+            prod.status = 'ready'
+            prod.processing_error = None
+    except Exception as exc:
+        LOGGER.exception('Background image processing failed for %s', product_id)
+        with session_scope() as db:
+            prod: Product = db.get(Product, product_id)
+            if prod:
+                prod.processing_error = str(exc)[:400]
+                prod.status = 'failed'
 @contextmanager
 def session_scope():
     """Small helper to get a DB session with automatic commit/rollback.
@@ -525,13 +667,39 @@ class ProductIn(BaseModel):
     images: List[str] = []
 
 class ProductOut(BaseModel):
-    id: str; title: str; description: str; category: str
-    price: int; cost: int; qty: int; available: bool; images: List[str]
+    id: str
+    title: str
+    description: str
+    category: str
+    price: int
+    cost: int
+    qty: int
+    available: bool
+    images: List[str]
+    status: str = "ready"
+    processing_error: Optional[str] = None
 
 class ProductListOut(BaseModel):
     items: List[ProductOut]
     total: Optional[int] = None
     next_offset: Optional[int] = None
+
+
+def _product_to_out(m: Product, *, include_processing_error: bool = True) -> ProductOut:
+    imgs = (m.images_small or []) or (m.images or [])
+    return ProductOut(
+        id=m.id,
+        title=m.title,
+        description=m.description,
+        category=m.category,
+        price=m.price_in_paise // 100,
+        cost=(getattr(m, 'cost_in_paise', 0) or 0) // 100,
+        qty=m.qty,
+        available=m.available,
+        images=imgs,
+        status=getattr(m, 'status', 'ready') or 'ready',
+        processing_error=(m.processing_error if include_processing_error else None),
+    )
 
 class OrderCreate(BaseModel):
     items: List[str]  # product IDs; fixed quantity = 1 per item
@@ -948,7 +1116,7 @@ def ai_describe(req: DescribeRequest):
 
 # ---- Products ----
 # CRUD endpoints used by both Customer and Owner apps
-@app.get("/products", response_model=ProductListOut, response_model_exclude={"items": {"__all__": {"cost"}}})
+@app.get("/products", response_model=ProductListOut, response_model_exclude={"items": {"__all__": {"cost", "processing_error"}}})
 def list_products(
     request: Request,
     response: Response,
@@ -963,6 +1131,7 @@ def list_products(
 ):
     with session_scope() as db:
         qry = db.query(Product)
+        qry = qry.filter(Product.status == "ready")
         if category:
             qry = qry.filter(Product.category == category)
         if q:
@@ -981,24 +1150,12 @@ def list_products(
             .limit(max(0, int(limit)))
             .all()
         )
-        items = []
+        items: List[ProductOut] = []
         for p in page:
-            imgs = (p.images_small or []) or (p.images or [])
-            if img_first and isinstance(imgs, list) and len(imgs) > 1:
-                imgs = [imgs[0]]
-            items.append(
-                ProductOut(
-                    id=p.id,
-                    title=p.title,
-                    description=p.description,
-                    category=p.category,
-                    price=p.price_in_paise // 100,
-                    cost=(getattr(p, 'cost_in_paise', 0) or 0) // 100,
-                    qty=p.qty,
-                    available=p.available,
-                    images=imgs,
-                )
-            )
+            out = _product_to_out(p, include_processing_error=False)
+            if img_first and isinstance(out.images, list) and len(out.images) > 1:
+                out.images = [out.images[0]]
+            items.append(out)
         next_offset = (offset + limit) if (offset + limit) < total else None
         # ETag + simple cache header
         import hashlib, json as _json
@@ -1064,20 +1221,7 @@ def list_products_owner(
             .limit(max(0, int(limit)))
             .all()
         )
-        items = []
-        for p in page:
-            imgs = (p.images_small or []) or (p.images or [])
-            items.append(ProductOut(
-                id=p.id,
-                title=p.title,
-                description=p.description,
-                category=p.category,
-                price=p.price_in_paise // 100,
-                cost=(getattr(p, 'cost_in_paise', 0) or 0) // 100,
-                qty=p.qty,
-                available=p.available,
-                images=imgs,
-            ))
+        items = [_product_to_out(p) for p in page]
         next_offset = (offset + limit) if (offset + limit) < total else None
         import hashlib, json as _json
         sig_src = _json.dumps({
@@ -1096,14 +1240,58 @@ def list_products_owner(
         response.headers['X-Cache'] = 'MISS'
         return {"items": items, "total": total, "next_offset": next_offset}
 
-@app.post("/products", response_model=ProductOut)
-def create_product(request: Request, p: ProductIn):
+
+@app.get("/owner/products/{pid}", response_model=ProductOut)
+def get_product_owner(request: Request, pid: str):
     require_admin(request)
     with session_scope() as db:
-        LOGGER.info("Create product: id=%s, title=%s, cat=%s, images=%d", p.id, p.title, p.category, len(p.images or []))
+        prod: Product = db.get(Product, pid)
+        if not prod:
+            raise HTTPException(404, "Product not found")
+        return _product_to_out(prod).model_dump()
+
+
+@app.post("/owner/products/{pid}/reprocess", response_model=ProductOut, status_code=status.HTTP_202_ACCEPTED)
+def reprocess_product(request: Request, pid: str, background_tasks: BackgroundTasks):
+    require_admin(request)
+    with session_scope() as db:
+        prod: Product = db.get(Product, pid)
+        if not prod:
+            raise HTTPException(404, "Product not found")
+        pending_raw = prod.pending_images or []
+        if pending_raw:
+            images_payload = _normalize_pending_images(pending_raw)
+        else:
+            current_full = list(prod.images or [])
+            current_small = list(prod.images_small or [])
+            images_payload = []
+            for idx, full in enumerate(current_full):
+                if not full:
+                    continue
+                small_val = current_small[idx] if idx < len(current_small) else None
+                images_payload.append({"src": full, "small": small_val})
+        if not images_payload:
+            raise HTTPException(400, "No images available to reprocess")
+        prod.pending_images = images_payload
+        prod.status = "processing"
+        prod.processing_error = None
+        prod.images = [item["src"] for item in images_payload]
+        db.flush()
+        out = _product_to_out(prod)
+    background_tasks.add_task(_process_product_images_async, pid, images_payload)
+    return out.model_dump()
+
+@app.post("/products", response_model=ProductOut, status_code=status.HTTP_202_ACCEPTED)
+def create_product(request: Request, p: ProductIn, background_tasks: BackgroundTasks):
+    require_admin(request)
+    raw_images = [img for img in list(p.images or []) if img]
+    pending_payload = [{"src": img, "small": None} for img in raw_images]
+    with session_scope() as db:
+        LOGGER.info("Create product: id=%s, title=%s, cat=%s, images=%d", p.id, p.title, p.category, len(raw_images))
         if db.get(Product, p.id):
             raise HTTPException(409, "Product ID already exists")
-        imgs_full, thumbs = maybe_upload_to_cdn(p.images, p.id)
+        status_val = "processing" if pending_payload else "ready"
+        placeholder_images = [item["src"] for item in pending_payload] if status_val == "processing" else []
         m = Product(
             id=p.id,
             title=p.title,
@@ -1113,26 +1301,23 @@ def create_product(request: Request, p: ProductIn):
             cost_in_paise=(p.cost or 0) * 100,
             qty=p.qty,
             available=p.available and p.qty > 0,
-            images=imgs_full,
-            images_small=thumbs,
+            images=placeholder_images,
+            images_small=placeholder_images,
+            status=status_val,
+            processing_error=None,
+            pending_images=pending_payload,
         )
         db.add(m)
         db.flush()
-        return ProductOut(
-            id=m.id,
-            title=m.title,
-            description=m.description,
-            category=m.category,
-            price=m.price_in_paise // 100,
-            cost=(m.cost_in_paise or 0)//100,
-            qty=m.qty,
-            available=m.available,
-            images=m.images or [],
-        ).model_dump()
+        out = _product_to_out(m)
+    if pending_payload:
+        background_tasks.add_task(_process_product_images_async, p.id, pending_payload)
+    return out.model_dump()
 
 @app.patch("/products/{pid}", response_model=ProductOut)
-def update_product(request: Request, pid: str, p: ProductIn):
+def update_product(request: Request, pid: str, p: ProductIn, background_tasks: BackgroundTasks):
     require_admin(request)
+    pending_payload = None
     with session_scope() as db:
         LOGGER.info("Update product: id=%s, title=%s, cat=%s, images=%d", pid, p.title, p.category, len(p.images or []))
         m: Product = db.get(Product, pid)
@@ -1145,84 +1330,43 @@ def update_product(request: Request, pid: str, p: ProductIn):
         m.cost_in_paise = (p.cost or 0) * 100
         m.qty = p.qty
         m.available = p.available and p.qty > 0
-        # If images are unchanged, avoid re-uploading or altering URLs
-        incoming_images = list(p.images or [])
-        try:
-            current_images = list(m.images or [])
-        except Exception:
-            current_images = []
-        try:
-            current_small = list(m.images_small or [])
-        except Exception:
-            current_small = []
+        incoming_images = [img for img in list(p.images or []) if img]
+        current_images = list(m.images or [])
+        current_small = list(m.images_small or [])
+        existing_preview: dict[str, list[Optional[str]]] = {}
+        for idx, img_url in enumerate(current_images):
+            thumb = current_small[idx] if idx < len(current_small) else None
+            existing_preview.setdefault(img_url, []).append(thumb)
+        images_changed = incoming_images != current_images
 
-        if incoming_images and (
-            incoming_images == current_images or (
-                current_small and incoming_images == current_small
-            )
-        ):
-            LOGGER.info("Update product: images unchanged, skipping re-upload for %s", pid)
-        elif not incoming_images:
-            LOGGER.info("Update product: no images provided, preserving existing for %s", pid)
-        else:
-            # Preserve existing URLs (full + thumb) where possible, and only upload new ones
-            existing_map: dict[str, tuple[str, Optional[str]]] = {}
-            for idx, full_url in enumerate(current_images):
-                small_url = current_small[idx] if idx < len(current_small) else None
-                existing_map[full_url] = (full_url, small_url)
-            for idx, thumb_url in enumerate(current_small):
-                if thumb_url and idx < len(current_images):
-                    existing_map.setdefault(thumb_url, (current_images[idx], thumb_url))
-
-            new_payloads: list[str] = []
-            for val in incoming_images:
-                if val in existing_map:
-                    continue
-                new_payloads.append(val)
-
-            uploaded_full: list[str] = []
-            uploaded_thumbs: list[str] = []
-            if new_payloads:
-                t_img = time.perf_counter() if OBS_LOG_TIMING else None
-                uploaded_full, uploaded_thumbs = maybe_upload_to_cdn(new_payloads, p.id)
-                if t_img is not None:
-                    LOGGER.info(
-                        "Products upload processed images=%d provider=%s latency=%.1fms",
-                        len(new_payloads),
-                        IMAGE_PROVIDER,
-                        (time.perf_counter() - t_img) * 1000.0,
-                    )
-            new_iter = iter(zip(uploaded_full, uploaded_thumbs))
-
-            out_full: list[str] = []
-            out_small: list[str] = []
-            for val in incoming_images:
-                if val in existing_map:
-                    full_url, thumb_url = existing_map[val]
-                    out_full.append(full_url)
-                    out_small.append(thumb_url or make_thumbnails([full_url])[0])
-                else:
-                    try:
-                        full_url, thumb_url = next(new_iter)
-                    except StopIteration:
-                        full_url, thumb_url = val, make_thumbnails([val])[0]
-                    out_full.append(full_url)
-                    out_small.append(thumb_url)
-
-            m.images = out_full
-            m.images_small = out_small
+        if images_changed:
+            if incoming_images:
+                preview_smalls: list[str] = []
+                payload: list[dict[str, Optional[str]]] = []
+                for val in incoming_images:
+                    small_list = existing_preview.get(val)
+                    small_val = small_list.pop(0) if small_list else None
+                    payload.append({"src": val, "small": small_val})
+                    preview_smalls.append(small_val or val)
+                pending_payload = payload
+                m.pending_images = payload
+                m.status = "processing"
+                m.processing_error = None
+                m.images = [item["src"] for item in payload]
+                m.images_small = preview_smalls
+            else:
+                # Explicitly cleared images
+                m.pending_images = []
+                m.images = []
+                m.images_small = []
+                m.status = "ready"
+                m.processing_error = None
         db.flush()
-        return ProductOut(
-            id=m.id,
-            title=m.title,
-            description=m.description,
-            category=m.category,
-            price=m.price_in_paise // 100,
-            cost=(m.cost_in_paise or 0)//100,
-            qty=m.qty,
-            available=m.available,
-            images=m.images or [],
-        ).model_dump()
+        out = _product_to_out(m)
+
+    if images_changed and pending_payload:
+        background_tasks.add_task(_process_product_images_async, pid, pending_payload)
+    return out.model_dump()
 
 @app.delete("/products/{pid}")
 def delete_product(request: Request, pid: str):
