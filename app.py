@@ -16,7 +16,7 @@ Suggested env (.env):
   AWS_S3_FOLDER_PREFIX=dev/
 """
 from __future__ import annotations
-import os, json, uuid, logging
+import os, json, uuid, logging, time
 from pathlib import Path
 from typing import List, Optional
 from contextlib import contextmanager
@@ -404,11 +404,20 @@ def s3_upload_bytes(key: str, data: bytes, content_type: str, cache_control: str
     if cache_control:
         extra["CacheControl"] = cache_control
     s3 = boto3.client("s3", region_name=AWS_S3_REGION or None)
+    t0 = time.perf_counter() if OBS_LOG_TIMING else None
     try:
         s3.put_object(Bucket=AWS_S3_BUCKET, Key=key, Body=data, **extra)
     except Exception as e:
         LOGGER.exception("S3 put_object failed (bucket=%s key=%s)", AWS_S3_BUCKET, key)
         raise
+    finally:
+        if t0 is not None:
+            LOGGER.info(
+                "S3 put_object key=%s size=%d latency=%.1fms",
+                key,
+                len(data or b""),
+                (time.perf_counter() - t0) * 1000.0,
+            )
     if AWS_S3_CDN_BASE_URL:
         return f"{AWS_S3_CDN_BASE_URL.rstrip('/')}/{key}"
     if AWS_S3_REGION:
@@ -443,8 +452,17 @@ def s3_upload_images(product_id: str, images: list[str]) -> tuple[list[str], lis
             except Exception:
                 data, mime = b"", "image/jpeg"
         # re-encode originals to jpeg at 85 to cap size
+        t_resize = time.perf_counter() if OBS_LOG_TIMING else None
         full_jpeg = _jpeg_resize_bytes(data, max_size=(2000,2000), quality=85)
         thumb_jpeg = _jpeg_resize_bytes(data, max_size=(640,640), quality=75)
+        if t_resize is not None:
+            LOGGER.info(
+                "Image reencode latency=%.1fms size_in=%d size_full=%d size_thumb=%d",
+                (time.perf_counter() - t_resize) * 1000.0,
+                len(data or b""),
+                len(full_jpeg or b""),
+                len(thumb_jpeg or b""),
+            )
         try:
             full_url = s3_upload_bytes(key_full, full_jpeg, "image/jpeg")
             thumb_url = s3_upload_bytes(key_thumb, thumb_jpeg, "image/jpeg")
@@ -883,12 +901,21 @@ def ai_describe(req: DescribeRequest):
             },
         ]
         # Ask the model (gpt-4o by default) to generate JSON only
+        t0 = time.perf_counter()
         resp = _openai_client.chat.completions.create(
             model=AI_MODEL,
             messages=messages,
             max_tokens=600,
             temperature=0.2,
         )
+        if OBS_LOG_TIMING:
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            LOGGER.info(
+                "AI describe OpenAI latency=%.1fms images=%d model=%s",
+                latency_ms,
+                len(req.image_urls),
+                AI_MODEL,
+            )
         content = resp.choices[0].message.content or "{}"
         if os.getenv("DEBUG_AI"):
             LOGGER.info("AI describe raw content: %s", content)
@@ -909,6 +936,13 @@ def ai_describe(req: DescribeRequest):
         LOGGER.error("OpenAI returned invalid JSON: %s", content)
         raise HTTPException(502, "Invalid response from OpenAI")
     except Exception as e:
+        if 't0' in locals() and OBS_LOG_TIMING:
+            LOGGER.warning(
+                "AI describe OpenAI failure latency=%.1fms images=%d model=%s",
+                (time.perf_counter() - t0) * 1000.0,
+                len(req.image_urls),
+                AI_MODEL,
+            )
         LOGGER.exception("OpenAI describe failed (images=%d)", len(req.image_urls))
         raise HTTPException(500, f"OpenAI error: {e}")
 
@@ -1149,7 +1183,15 @@ def update_product(request: Request, pid: str, p: ProductIn):
             uploaded_full: list[str] = []
             uploaded_thumbs: list[str] = []
             if new_payloads:
+                t_img = time.perf_counter() if OBS_LOG_TIMING else None
                 uploaded_full, uploaded_thumbs = maybe_upload_to_cdn(new_payloads, p.id)
+                if t_img is not None:
+                    LOGGER.info(
+                        "Products upload processed images=%d provider=%s latency=%.1fms",
+                        len(new_payloads),
+                        IMAGE_PROVIDER,
+                        (time.perf_counter() - t_img) * 1000.0,
+                    )
             new_iter = iter(zip(uploaded_full, uploaded_thumbs))
 
             out_full: list[str] = []
