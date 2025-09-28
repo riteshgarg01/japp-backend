@@ -959,9 +959,7 @@ def health_obs_history(limit_minutes: int = 60):
 
 @app.get("/health")
 def health():
-    # Avoid leaking full DB URL in prod
-    if ENVIRONMENT == "prod":
-        return {"ok": True, "db": DATABASE_URL}
+    return {"ok": True}
 
 @app.get("/config")
 def get_config():
