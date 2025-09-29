@@ -89,15 +89,16 @@ LOGO_URL = os.getenv("LOGO_URL", "")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o")
 AI_PROMPT_SYSTEM = os.getenv(
     "AI_PROMPT_SYSTEM",
-    "You are a Product listing expert for a Shopify store that sells artificial jewelry in India.",
+    "You are a Product listing expert for a Shopify store that sells artificial jewelry in India. Identify materials and craftsmanship styles accurately.",
 )
 AI_PROMPT_USER = os.getenv(
     "AI_PROMPT_USER",
     (
         "Please analyze these image(s) of artificial jewelry to be listed on the Shopify store.\n"
-        "Output must be STRICT JSON with keys: title, description, category.\n"
+        "Output must be STRICT JSON with keys: title, description, category, style_tag.\n"
         "A good listing uses a title and description that are relevant to the jewelry material and type, tailored for an Indian audience.\n"
         "Avoid any words implying precious metals or real gemstones (gold, silver, diamond, etc.). Neutral descriptors allowed: 'silver-tone', 'kundan', 'polki', 'oxidized', 'meenakari', 'pearl', 'american diamond (AD)', 'moissanite'.\n"
+        "style_tag must capture the jewellery style / craftsmanship (e.g., Kundan, Oxidized Silver, American Diamond) using the closest match from this list: American Diamond, Antique Gold Plated, Beaded, German Silver, Kundan, Meenakari, Mirror Work, Moissanite, Oxidized Silver, Pearl, Polki, Rose Gold Plated, Temple, Terracotta, Thread Work. If unsure, respond with 'Not specified'.\n"
         "Category must be one of: Anklets, Bracelets, Brooches & Lapel Pins, Charms & Pendants, Earrings, Jewelry Sets, Necklaces, Rings.\n"
         "If a necklace is shown with matching earrings, choose 'Jewelry Sets'. If only a necklace is present, choose 'Necklaces'. If only earrings, choose 'Earrings'."
     ),
@@ -116,6 +117,79 @@ try:
     )
 except Exception:
     pass
+
+JEWELRY_STYLE_OPTIONS = [
+    "American Diamond",
+    "Antique Gold Plated",
+    "Beaded",
+    "German Silver",
+    "Kundan",
+    "Meenakari",
+    "Mirror Work",
+    "Moissanite",
+    "Oxidized Silver",
+    "Pearl",
+    "Polki",
+    "Rose Gold Plated",
+    "Temple",
+    "Terracotta",
+    "Thread Work",
+]
+
+_STYLE_LOOKUP = {val.lower(): val for val in JEWELRY_STYLE_OPTIONS}
+_STYLE_SYNONYMS = {
+    "ad": "American Diamond",
+    "cz": "American Diamond",
+    "cz stone": "American Diamond",
+    "american diamond (ad)": "American Diamond",
+    "oxidised": "Oxidized Silver",
+    "oxidized": "Oxidized Silver",
+    "oxidized silver": "Oxidized Silver",
+    "oxidised silver": "Oxidized Silver",
+    "kundan work": "Kundan",
+    "polki work": "Polki",
+    "meenakari work": "Meenakari",
+    "mirror": "Mirror Work",
+    "mirror work": "Mirror Work",
+    "beads": "Beaded",
+    "beaded": "Beaded",
+    "thread": "Thread Work",
+    "thread work": "Thread Work",
+    "temple jewellery": "Temple",
+    "temple jewelry": "Temple",
+    "german silver": "German Silver",
+    "antique gold": "Antique Gold Plated",
+    "antique finish": "Antique Gold Plated",
+    "rose gold": "Rose Gold Plated",
+    "pearl work": "Pearl",
+    "terracotta": "Terracotta",
+    "moissanite": "Moissanite",
+}
+
+
+def _normalize_style_tag(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    key = raw.lower()
+    if key in {"not specified", "unspecified", "n/a", "na", "none"}:
+        return None
+    if key in _STYLE_SYNONYMS:
+        return _STYLE_SYNONYMS[key]
+    if key in _STYLE_LOOKUP:
+        return _STYLE_LOOKUP[key]
+    simplified = key.replace("jewellery", "").replace("jewelry", "").strip()
+    if simplified in _STYLE_SYNONYMS:
+        return _STYLE_SYNONYMS[simplified]
+    if simplified in _STYLE_LOOKUP:
+        return _STYLE_LOOKUP[simplified]
+    for option in JEWELRY_STYLE_OPTIONS:
+        opt_lower = option.lower()
+        if key in opt_lower or opt_lower in key or simplified in opt_lower or opt_lower in simplified:
+            return option
+    return raw.title()
 
 # Robust env parsers (tolerate accidental inline comments like "700: warn for slow calls")
 def _int_env(name: str, default: int) -> int:
@@ -183,6 +257,7 @@ class Product(Base):
     title = Column(String, nullable=False)
     description = Column(String, nullable=False)
     category = Column(String, index=True, nullable=False)
+    style_tag = Column(String, index=True, nullable=True)
     price_in_paise = Column(Integer, nullable=False)
     cost_in_paise = Column(Integer, nullable=False, default=0)
     qty = Column(Integer, nullable=False, default=0)
@@ -249,6 +324,8 @@ try:
                 conn.exec_driver_sql("ALTER TABLE products ADD COLUMN processing_error TEXT")
             if "pending_images" not in cols_products:
                 conn.exec_driver_sql("ALTER TABLE products ADD COLUMN pending_images JSON")
+            if "style_tag" not in cols_products:
+                conn.exec_driver_sql("ALTER TABLE products ADD COLUMN style_tag TEXT")
 
             cols_orders = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(orders)").fetchall()}
             if "confirmed_at" not in cols_orders:
@@ -264,6 +341,7 @@ try:
             conn.exec_driver_sql("ALTER TABLE products ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ready'")
             conn.exec_driver_sql("ALTER TABLE products ADD COLUMN IF NOT EXISTS processing_error TEXT")
             conn.exec_driver_sql("ALTER TABLE products ADD COLUMN IF NOT EXISTS pending_images JSON")
+            conn.exec_driver_sql("ALTER TABLE products ADD COLUMN IF NOT EXISTS style_tag TEXT")
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN IF NOT EXISTS confirmed_at TEXT")
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN IF NOT EXISTS removed_items JSON DEFAULT '[]'::json")
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN IF NOT EXISTS session_id TEXT")
@@ -660,6 +738,7 @@ class ProductIn(BaseModel):
     title: str
     description: str
     category: str
+    style_tag: Optional[str] = None
     price: int = Field(..., ge=0, description="Price in INR whole rupees")
     cost: int = Field(0, ge=0, description="Optional cost in INR whole rupees")
     qty: int = Field(..., ge=0)
@@ -671,6 +750,7 @@ class ProductOut(BaseModel):
     title: str
     description: str
     category: str
+    style_tag: Optional[str] = None
     price: int
     cost: int
     qty: int
@@ -692,6 +772,7 @@ def _product_to_out(m: Product, *, include_processing_error: bool = True) -> Pro
         title=m.title,
         description=m.description,
         category=m.category,
+        style_tag=_normalize_style_tag(getattr(m, 'style_tag', None)),
         price=m.price_in_paise // 100,
         cost=(getattr(m, 'cost_in_paise', 0) or 0) // 100,
         qty=m.qty,
@@ -726,6 +807,7 @@ class DescribeResponse(BaseModel):
     title: str
     description: str
     category: str
+    style_tag: Optional[str] = None
 
 # ----- FastAPI -----
 app = FastAPI(title="Arohi Backend", version="0.1.0")
@@ -1039,19 +1121,21 @@ def ai_describe(req: DescribeRequest):
     if AI_DEBUG:
         LOGGER.info("AI describe fallback: AI_DEBUG=1 (images=%d)", len(req.image_urls))
         cat = "Jewelry Sets" if len(req.image_urls) != 1 else "Earrings"
+        style_guess = _normalize_style_tag("Kundan" if cat == "Jewelry Sets" else "Oxidized Silver")
         title = "Elegant kundan jewelry set" if cat == "Jewelry Sets" else "Minimalist oxidized earrings"
         description = (
             "Developer mode (AI_DEBUG) is ON: sample metadata. Silver-tone detailing; suitable for festive and everyday wear."
         )
-        return DescribeResponse(title=title, description=description, category=cat)
+        return DescribeResponse(title=title, description=description, category=cat, style_tag=style_guess)
     if not _openai_client:
         LOGGER.warning("AI describe fallback: OpenAI client unavailable (images=%d)", len(req.image_urls))
         cat = "Jewelry Sets" if len(req.image_urls) != 1 else "Earrings"
+        style_guess = _normalize_style_tag("Kundan" if cat == "Jewelry Sets" else "Oxidized Silver")
         title = "Elegant kundan jewelry set" if cat == "Jewelry Sets" else "Minimalist oxidized earrings"
         description = (
             "Developer mode (AI client missing) is ON: sample metadata. Silver-tone detailing; suitable for festive and everyday wear."
         )
-        return DescribeResponse(title=title, description=description, category=cat)
+        return DescribeResponse(title=title, description=description, category=cat, style_tag=style_guess)
     if not req.image_urls:
         raise HTTPException(400, "image_urls required")
     try:
@@ -1097,6 +1181,8 @@ def ai_describe(req: DescribeRequest):
                 raise
         if "description" not in data and "description_" in data:
             data["description"] = data.get("description_")
+        if "style_tag" in data:
+            data["style_tag"] = _normalize_style_tag(data.get("style_tag"))
         return DescribeResponse(**data)
     except json.JSONDecodeError:
         LOGGER.error("OpenAI returned invalid JSON: %s", content)
@@ -1123,15 +1209,19 @@ def list_products(
     min_price: Optional[int] = None,
     max_price: Optional[int] = None,
     only_available: bool = False,
+    style_tag: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
     img_first: bool = False,
-):
+): 
     with session_scope() as db:
         qry = db.query(Product)
         qry = qry.filter(Product.status == "ready")
         if category:
             qry = qry.filter(Product.category == category)
+        style_filter = _normalize_style_tag(style_tag)
+        if style_filter:
+            qry = qry.filter(Product.style_tag == style_filter)
         if q:
             like = f"%{q}%"
             qry = qry.filter((Product.title.ilike(like)) | (Product.description.ilike(like)))
@@ -1159,7 +1249,7 @@ def list_products(
         import hashlib, json as _json
         sig_src = _json.dumps({
             'params': {'category': category, 'q': q, 'min': min_price, 'max': max_price,
-                       'only': only_available, 'limit': limit, 'offset': offset},
+                       'only': only_available, 'style': style_filter, 'limit': limit, 'offset': offset},
             'items': [{'id': p.id, 'qty': p.qty, 'avail': p.available, 'price': p.price_in_paise} for p in page]
         }, sort_keys=True).encode('utf-8')
         etag = 'W/"' + hashlib.sha1(sig_src).hexdigest() + '"'
@@ -1194,6 +1284,7 @@ def list_products_owner(
     min_price: Optional[int] = None,
     max_price: Optional[int] = None,
     only_available: bool = False,
+    style_tag: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
 ):
@@ -1203,6 +1294,9 @@ def list_products_owner(
         qry = db.query(Product)
         if category:
             qry = qry.filter(Product.category == category)
+        style_filter = _normalize_style_tag(style_tag)
+        if style_filter:
+            qry = qry.filter(Product.style_tag == style_filter)
         if q:
             like = f"%{q}%"
             qry = qry.filter((Product.title.ilike(like)) | (Product.description.ilike(like)))
@@ -1224,7 +1318,7 @@ def list_products_owner(
         import hashlib, json as _json
         sig_src = _json.dumps({
             'params': {'category': category, 'q': q, 'min': min_price, 'max': max_price,
-                       'only': only_available, 'limit': limit, 'offset': offset},
+                       'only': only_available, 'style': style_filter, 'limit': limit, 'offset': offset},
             'items': [{'id': p.id, 'qty': p.qty, 'avail': p.available, 'price': p.price_in_paise} for p in page]
         }, sort_keys=True).encode('utf-8')
         etag = 'W/"' + hashlib.sha1(sig_src).hexdigest() + '"'
@@ -1285,7 +1379,14 @@ def create_product(request: Request, p: ProductIn, background_tasks: BackgroundT
     raw_images = [img for img in list(p.images or []) if img]
     pending_payload = [{"src": img, "small": None} for img in raw_images]
     with session_scope() as db:
-        LOGGER.info("Create product: id=%s, title=%s, cat=%s, images=%d", p.id, p.title, p.category, len(raw_images))
+        LOGGER.info(
+            "Create product: id=%s, title=%s, cat=%s, style_tag=%s, images=%d",
+            p.id,
+            p.title,
+            p.category,
+            _normalize_style_tag(getattr(p, "style_tag", None)),
+            len(raw_images),
+        )
         if db.get(Product, p.id):
             raise HTTPException(409, "Product ID already exists")
         status_val = "processing" if pending_payload else "ready"
@@ -1295,6 +1396,7 @@ def create_product(request: Request, p: ProductIn, background_tasks: BackgroundT
             title=p.title,
             description=p.description,
             category=p.category,
+            style_tag=_normalize_style_tag(getattr(p, "style_tag", None)),
             price_in_paise=p.price * 100,
             cost_in_paise=(p.cost or 0) * 100,
             qty=p.qty,
@@ -1317,13 +1419,22 @@ def update_product(request: Request, pid: str, p: ProductIn, background_tasks: B
     require_admin(request)
     pending_payload = None
     with session_scope() as db:
-        LOGGER.info("Update product: id=%s, title=%s, cat=%s, images=%d", pid, p.title, p.category, len(p.images or []))
+        LOGGER.info(
+            "Update product: id=%s, title=%s, cat=%s, style_tag=%s, images=%d",
+            pid,
+            p.title,
+            p.category,
+            _normalize_style_tag(getattr(p, "style_tag", None)),
+            len(p.images or []),
+        )
         m: Product = db.get(Product, pid)
         if not m:
             raise HTTPException(404, "Product not found")
         m.title = p.title
         m.description = p.description
         m.category = p.category
+        if "style_tag" in p.model_fields_set:
+            m.style_tag = _normalize_style_tag(p.style_tag)
         m.price_in_paise = p.price * 100
         m.cost_in_paise = (p.cost or 0) * 100
         m.qty = p.qty
