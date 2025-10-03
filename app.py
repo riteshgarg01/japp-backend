@@ -16,11 +16,13 @@ Suggested env (.env):
   AWS_S3_FOLDER_PREFIX=dev/
 """
 from __future__ import annotations
-import os, json, uuid, logging, time
+import os, json, uuid, logging, time, boto3
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 from contextlib import contextmanager
 from dotenv import load_dotenv
+from botocore.config import Config
+from botocore.exceptions import ClientError
 
 # Load environment variables from .env file
 load_dotenv()
@@ -33,7 +35,7 @@ from fastapi import FastAPI, HTTPException, Body, Request, Response, BackgroundT
 from collections import defaultdict, deque
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy import create_engine, Column, String, Integer, Boolean, JSON, text, ForeignKey
 from datetime import datetime, timedelta
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
@@ -105,6 +107,14 @@ AI_PROMPT_USER = os.getenv(
 )
 AI_DEBUG = os.getenv("AI_DEBUG", "0").lower() in {"1", "true", "yes"}
 OBS_LOG_TIMING = os.getenv("OBS_LOG_TIMING", "1").lower() in {"1","true","yes"}
+CART_ABANDON_DAYS = int(os.getenv("CART_ABANDON_DAYS", "30") or 30)
+ORDER_STATUS_PENDING = "pending"
+ORDER_STATUS_CONFIRMED = "confirmed"
+ORDER_STATUS_ACTIVE_CART = "ACTIVE_CART"
+ORDER_STATUS_ABANDONED_CART = "ABANDONED_CART"
+ORDER_STATUS_CANCELLED = "CANCELLED"
+CART_REUSABLE_STATUSES = {ORDER_STATUS_ACTIVE_CART, ORDER_STATUS_ABANDONED_CART}
+CART_FINAL_STATUSES = {ORDER_STATUS_PENDING, ORDER_STATUS_CONFIRMED, ORDER_STATUS_CANCELLED}
 
 # Log key AI settings once on startup to help diagnose prod vs dev behaviour
 try:
@@ -236,6 +246,8 @@ AWS_S3_CDN_BASE_URL = os.getenv("AWS_S3_CDN_BASE_URL", "")
 # Environment-specific S3 folder prefix (dev/staging/prod)
 ENVIRONMENT = os.getenv("ENVIRONMENT", "dev").lower()
 AWS_S3_FOLDER_PREFIX = os.getenv("AWS_S3_FOLDER_PREFIX", f"{ENVIRONMENT}/")
+MAIL_FROM    = os.getenv("MAIL_FROM")     # SES-verified identity
+OWNER_EMAIL  = os.getenv("OWNER_EMAIL")   # Recipient of notifications
 
 engine = create_engine(DATABASE_URL, future=True)
 # SessionLocal is a factory that gives us a new DB session for each request
@@ -278,9 +290,10 @@ class Order(Base):
     __tablename__ = "orders"
     id = Column(String, primary_key=True)  # e.g., ORD-xxx
     customer_phone = Column(String, nullable=False)
-    status = Column(String, nullable=False, default="pending")  # pending | confirmed | cancelled
+    status = Column(String, nullable=False, default="pending")  # pending | confirmed | ACTIVE_CART | ABANDONED_CART | CANCELLED
     created_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
     confirmed_at = Column(String, nullable=True)
+    updated_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
     removed_items = Column(JSON, nullable=False, default=list)
     session_id = Column(String, nullable=True)
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
@@ -299,6 +312,7 @@ class Event(Base):
     __tablename__ = "events"
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     session_id = Column(String, index=True, nullable=True)
+    customer_phone = Column(String, index=True, nullable=True)
     kind = Column(String, index=True, nullable=False)  # add_to_cart | remove_from_cart | send_order | confirm_order
     payload = Column(JSON, nullable=True, default=dict)
     created_at = Column(String, server_default=text("CURRENT_TIMESTAMP"))
@@ -334,6 +348,11 @@ try:
                 conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN removed_items JSON DEFAULT '[]'")
             if "session_id" not in cols_orders:
                 conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN session_id TEXT")
+            if "updated_at" not in cols_orders:
+                conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN updated_at TEXT")
+            cols_events = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(events)").fetchall()}
+            if "customer_phone" not in cols_events:
+                conn.exec_driver_sql("ALTER TABLE events ADD COLUMN customer_phone TEXT")
         else:
             # Engines like Postgres support IF NOT EXISTS directly
             conn.exec_driver_sql("ALTER TABLE products ADD COLUMN IF NOT EXISTS cost_in_paise INTEGER DEFAULT 0")
@@ -345,12 +364,25 @@ try:
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN IF NOT EXISTS confirmed_at TEXT")
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN IF NOT EXISTS removed_items JSON DEFAULT '[]'::json")
             conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN IF NOT EXISTS session_id TEXT")
+            conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TEXT")
+            conn.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS customer_phone TEXT")
 
         # Helpful indexes (supported on both SQLite and Postgres)
         conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_products_created_at ON products(created_at)")
         conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)")
         conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_products_available_qty ON products(available, qty)")
         conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_orders_session_created ON orders(session_id, created_at)")
+        if _dialect == "sqlite":
+            conn.exec_driver_sql(
+                "DELETE FROM order_items WHERE rowid NOT IN (SELECT MIN(rowid) FROM order_items GROUP BY order_id, product_id)"
+            )
+        else:
+            conn.exec_driver_sql(
+                "DELETE FROM order_items a USING order_items b WHERE a.ctid < b.ctid AND a.order_id = b.order_id AND a.product_id = b.product_id"
+            )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_order_items_unique ON order_items(order_id, product_id)"
+        )
 
         # Create events table if missing
         payload_type = "JSON"
@@ -359,6 +391,7 @@ try:
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
                 session_id TEXT,
+                customer_phone TEXT,
                 kind TEXT NOT NULL,
                 payload {payload_type},
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -368,6 +401,43 @@ try:
         conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id)")
 except Exception as _e:
     LOGGER.warning("Schema patch skipped/failure: %s", _e)
+
+# boto3 SES client with standard retry/backoff
+ses = boto3.client(
+    "ses",
+    region_name=AWS_S3_REGION,
+    config=Config(retries={"max_attempts": 5, "mode": "standard"})
+)
+
+def send_owner_email_api(req: NotifyRequest):
+    """Fire email via SES API. Raises on hard failures; FastAPI will log it."""
+    subject = f"New order request #{req.orderId}"
+    text = (
+        f"New order request {req.orderId}\n"
+        f"Items: {', '.join(req.items) if req.items else '—'}\n"
+        f"Customer: {req.customerPhone or '—'}\n"
+    )
+    html = (
+        f"<h2>New order request {req.orderId}</h2>"
+        f"<p><b>Items:</b> {', '.join(req.items) if req.items else '—'}</p>"
+        f"<p><b>Customer:</b> {req.customerPhone or '—'}</p>"
+    )
+    try:
+        ses.send_email(
+            Source=MAIL_FROM,  # must be SES-verified (email or domain)
+            Destination={"ToAddresses": [OWNER_EMAIL]},
+            Message={
+                "Subject": {"Data": subject},
+                "Body": {
+                    "Text": {"Data": text},
+                    "Html": {"Data": html},
+                },
+            },
+        )
+    except ClientError as e:
+        # Don’t throw inside BackgroundTasks back to client; just log
+        logger.error("SES send_email failed: %s", e, exc_info=True)
+        # Optional: add your own Sentry/CloudWatch metric here
 
 # ---- Image utilities (optional Pillow) ----
 def _make_thumbnail_dataurl(data_url: str, max_size=(640, 640), quality=70) -> str:
@@ -782,17 +852,132 @@ def _product_to_out(m: Product, *, include_processing_error: bool = True) -> Pro
         processing_error=(m.processing_error if include_processing_error else None),
     )
 
+def _order_to_out(o: Order) -> OrderOut:
+    return OrderOut(
+        id=o.id,
+        status=o.status,
+        customer_phone=o.customer_phone,
+        items=[item.product_id for item in o.items],
+        created_at=getattr(o, 'created_at', None),
+        updated_at=getattr(o, 'updated_at', None),
+        confirmed_at=getattr(o, 'confirmed_at', None),
+        removed_items=list(getattr(o, 'removed_items', []) or []),
+        session_id=getattr(o, 'session_id', None),
+    )
+
+def _now_iso() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _clean_phone(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _find_existing_cart(
+    db: Session,
+    *,
+    customer_phone: Optional[str],
+    session_id: Optional[str],
+    allowed_statuses: Optional[Set[str]] = None,
+) -> Optional[Order]:
+    phone = _clean_phone(customer_phone)
+    session = (session_id or None)
+    statuses = allowed_statuses or CART_REUSABLE_STATUSES
+
+    def _fetch(filter_expr):
+        query = db.query(Order).filter(filter_expr)
+        if statuses:
+            query = query.filter(Order.status.in_(tuple(statuses)))
+        return query.order_by(
+            Order.updated_at.desc().nullslast(),
+            Order.created_at.desc().nullslast(),
+        ).first()
+
+    order = None
+    if phone:
+        order = _fetch(Order.customer_phone == phone)
+    if order is None and session:
+        order = _fetch(Order.session_id == session)
+    return order
+
+def _get_or_create_cart(
+    db: Session, *, customer_phone: Optional[str], session_id: Optional[str], allow_create: bool
+) -> Optional[Order]:
+    phone = _clean_phone(customer_phone)
+    session = (session_id or None)
+
+    order = _find_existing_cart(
+        db,
+        customer_phone=phone,
+        session_id=session,
+        allowed_statuses=CART_REUSABLE_STATUSES,
+    )
+    if order:
+        if phone and order.customer_phone != phone:
+            order.customer_phone = phone
+        if session and order.session_id != session:
+            order.session_id = session
+        if order.status == ORDER_STATUS_ABANDONED_CART:
+            order.status = ORDER_STATUS_ACTIVE_CART
+        return order
+    if not allow_create or not phone:
+        return None
+    now = _now_iso()
+    new_order = Order(
+        id=f"ORD-{uuid.uuid4().hex[:8]}",
+        customer_phone=phone,
+        status=ORDER_STATUS_ACTIVE_CART,
+        session_id=session,
+        removed_items=[],
+    )
+    new_order.created_at = now
+    new_order.updated_at = now
+    db.add(new_order)
+    db.flush()
+    return new_order
+
+
+def _sync_order_items(order: Order, product_ids: List[str], db: Session) -> None:
+    wanted = list(dict.fromkeys(pid for pid in product_ids if pid))
+    kept: list[OrderItem] = []
+    existing_ids: set[str] = set()
+    for item in list(order.items):
+        if item.product_id not in wanted or item.product_id in existing_ids:
+            db.delete(item)
+            continue
+        existing_ids.add(item.product_id)
+        kept.append(item)
+    order.items = kept
+    for pid in wanted:
+        if pid not in existing_ids:
+            db.add(OrderItem(order=order, product_id=pid, qty=1))
+            existing_ids.add(pid)
+    if order.removed_items:
+        order.removed_items = [pid for pid in (order.removed_items or []) if pid not in wanted]
 class OrderCreate(BaseModel):
     items: List[str]  # product IDs; fixed quantity = 1 per item
     customer_phone: str
     session_id: Optional[str] = None
 
 class OrderOut(BaseModel):
-    id: str; status: str; customer_phone: str; items: List[str]
+    id: str
+    status: str
+    customer_phone: str
+    items: List[str] = Field(default_factory=list)
     created_at: Optional[str] = None
+    updated_at: Optional[str] = None
     confirmed_at: Optional[str] = None
-    removed_items: Optional[List[str]] = []
-    created_at: Optional[str] = None
+    removed_items: List[str] = Field(default_factory=list)
+    session_id: Optional[str] = None
+
+
+class CartSyncRequest(BaseModel):
+    items: List[str] = Field(default_factory=list)
+    customer_phone: Optional[str] = None
+    session_id: Optional[str] = None
 
 class DescribeRequest(BaseModel):
     """Request body for /ai/describe.
@@ -1005,9 +1190,16 @@ async def _start_stats_loop():
                             "DELETE FROM events WHERE created_at < datetime('now', ?)",
                             (f"-{RETAIN_EVENTS_DAYS} days",),
                         )
+                        conn.exec_driver_sql(
+                            "UPDATE orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE status = ? AND datetime(updated_at) < datetime('now', ?)",
+                            (ORDER_STATUS_ABANDONED_CART, ORDER_STATUS_ACTIVE_CART, f'-{CART_ABANDON_DAYS} days'),
+                        )
                     else:
                         conn.exec_driver_sql(
                             f"DELETE FROM events WHERE created_at::timestamp < (CURRENT_TIMESTAMP - INTERVAL '{RETAIN_EVENTS_DAYS} days')"
+                        )
+                        conn.exec_driver_sql(
+                            f"UPDATE orders SET status = '{ORDER_STATUS_ABANDONED_CART}', updated_at = CURRENT_TIMESTAMP WHERE status = '{ORDER_STATUS_ACTIVE_CART}' AND updated_at::timestamp < (CURRENT_TIMESTAMP - INTERVAL '{CART_ABANDON_DAYS} days')"
                         )
             except Exception as e:
                 try: LOGGER.warning("retention error: %s", e)
@@ -1058,6 +1250,7 @@ def get_config():
 # ---- Analytics ----
 class EventIn(BaseModel):
     session_id: Optional[str] = None
+    customer_phone: Optional[str] = None
     kind: str
     payload: Optional[dict] = None
 
@@ -1066,12 +1259,14 @@ def create_event(e: EventIn):
     # Simple validation
     if not e.kind:
         raise HTTPException(400, "kind required")
+    payload = dict(e.payload or {})
+    phone = _clean_phone(e.customer_phone) or _clean_phone(payload.get('customer_phone'))
     with session_scope() as db:
-        ev = Event(session_id=e.session_id, kind=e.kind, payload=e.payload or {})
+        ev = Event(session_id=e.session_id, customer_phone=phone, kind=e.kind, payload=payload)
         db.add(ev)
         db.flush()
         try:
-            LOGGER.info("event: kind=%s session=%s", e.kind, (e.session_id or ""))
+            LOGGER.info("event: kind=%s session=%s phone=%s", e.kind, (e.session_id or ""), phone or '')
         except Exception:
             pass
         return {"ok": True, "id": ev.id}
@@ -1082,11 +1277,11 @@ def admin_events_recent(request: Request, limit: int = 50):
     require_admin(request)
     with engine.connect() as conn:
         rows = conn.exec_driver_sql(
-            "SELECT created_at, session_id, kind, payload FROM events ORDER BY created_at DESC LIMIT :limit",
+            "SELECT created_at, session_id, customer_phone, kind, payload FROM events ORDER BY created_at DESC LIMIT :limit",
             {"limit": max(1, int(limit))},
         ).fetchall()
     items = [
-        {"created_at": r[0], "session_id": r[1], "kind": r[2], "payload": r[3]}
+        {"created_at": r[0], "session_id": r[1], "customer_phone": r[2], "kind": r[3], "payload": r[4]}
         for r in rows
     ]
     return {"ok": True, "items": items}
@@ -1490,23 +1685,101 @@ def delete_product(request: Request, pid: str):
 # ---- Orders ----
 # A minimal flow: customers create a shortlist (an order with items),
 # owner confirms it which atomically decrements inventory.
+@app.get("/cart", response_model=OrderOut)
+def get_cart(session_id: Optional[str] = None, customer_phone: Optional[str] = None):
+    if not (session_id or customer_phone):
+        raise HTTPException(400, "session_id or customer_phone required")
+    with session_scope() as db:
+        order = _find_existing_cart(
+            db,
+            customer_phone=customer_phone,
+            session_id=session_id,
+            allowed_statuses=CART_REUSABLE_STATUSES,
+        )
+        if not order:
+            raise HTTPException(404, "Cart not found")
+        return _order_to_out(order)
+
+
+@app.post("/cart/sync", response_model=OrderOut)
+def sync_cart(req: CartSyncRequest):
+    if not (req.session_id or req.customer_phone):
+        raise HTTPException(400, "session_id or customer_phone required")
+    desired_items = list(dict.fromkeys(req.items or []))
+    with session_scope() as db:
+        order = _find_existing_cart(
+            db,
+            customer_phone=req.customer_phone,
+            session_id=req.session_id,
+            allowed_statuses=CART_REUSABLE_STATUSES,
+        )
+        if order is None:
+            if not desired_items:
+                raise HTTPException(404, "Cart not found")
+            phone_clean = _clean_phone(req.customer_phone)
+            if not phone_clean:
+                raise HTTPException(400, "customer_phone required to create cart")
+            order = _get_or_create_cart(
+                db,
+                customer_phone=phone_clean,
+                session_id=req.session_id,
+                allow_create=True,
+            )
+            if order is None:
+                raise HTTPException(400, "Unable to create cart")
+        phone_clean = _clean_phone(req.customer_phone)
+        if phone_clean and order.customer_phone != phone_clean:
+            order.customer_phone = phone_clean
+        if req.session_id and order.session_id != req.session_id:
+            order.session_id = req.session_id
+        _sync_order_items(order, desired_items, db)
+        if order.status != ORDER_STATUS_ACTIVE_CART:
+            order.status = ORDER_STATUS_ACTIVE_CART
+        order.updated_at = _now_iso()
+        db.flush()
+        return _order_to_out(order)
+
+
 @app.post("/orders", response_model=OrderOut)
 def create_order(req: OrderCreate):
     if not req.items:
         raise HTTPException(400, "No items")
+    phone = _clean_phone(req.customer_phone)
+    if not phone:
+        raise HTTPException(400, "customer_phone required")
     with session_scope() as db:
-        # Create order with fixed qty=1 per item
-        oid = f"ORD-{uuid.uuid4().hex[:8]}"
-        order = Order(id=oid, customer_phone=req.customer_phone, status="pending", session_id=req.session_id)
-        db.add(order)
-        for pid in req.items:
-            # validate product exists
-            prod = db.get(Product, pid)
-            if not prod:
-                raise HTTPException(400, f"Product not found: {pid}")
-            db.add(OrderItem(order=order, product_id=pid, qty=1))
+        missing = [pid for pid in req.items if not db.get(Product, pid)]
+        if missing:
+            raise HTTPException(400, f"Product not found: {missing[0]}")
+        order = _get_or_create_cart(db, customer_phone=phone, session_id=req.session_id, allow_create=True)
+        if not order:
+            raise HTTPException(500, "Failed to create cart")
+        _sync_order_items(order, req.items, db)
+        order.status = ORDER_STATUS_PENDING
+        order.customer_phone = phone
+        if req.session_id:
+            order.session_id = req.session_id
+        now = _now_iso()
+        if not getattr(order, 'created_at', None):
+            order.created_at = now
+        order.updated_at = now
         db.flush()
-        return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items])
+        return _order_to_out(order)
+
+
+# ---- Notify Owner ----
+class NotifyRequest(BaseModel):
+    orderId: str
+    items: list[str]
+    customerPhone: str
+
+@app.post("/notify-owner")
+def notify_owner(req: NotifyRequest, background: BackgroundTasks):
+    # Fire-and-forget so the UI never blocks on email
+    if not (MAIL_FROM and OWNER_EMAIL):
+        raise HTTPException(500, "Email sender/recipient not configured")
+    background.add_task(send_owner_email_api, req)
+    return {"ok": True}
 
 class OrdersBySessionOut(BaseModel):
     items: List[OrderOut]
@@ -1517,10 +1790,8 @@ def orders_by_session(session_id: str, limit: int = 1):
         raise HTTPException(400, "session_id required")
     with session_scope() as db:
         qry = db.query(Order).filter(Order.session_id == session_id)
-        page = qry.order_by(Order.created_at.desc()).limit(max(1, int(limit))).all()
-        out: List[OrderOut] = []
-        for o in page:
-            out.append(OrderOut(id=o.id, status=o.status, customer_phone=o.customer_phone, items=[i.product_id for i in o.items], created_at=o.created_at, confirmed_at=o.confirmed_at, removed_items=o.removed_items))
+        page = qry.order_by(Order.updated_at.desc().nullslast(), Order.created_at.desc().nullslast()).limit(max(1, int(limit))).all()
+        out = [_order_to_out(o) for o in page]
         return {"items": out}
 
 @app.patch("/orders/{oid}/confirm", response_model=OrderOut)
@@ -1530,8 +1801,10 @@ def confirm_order(request: Request, oid: str):
         order: Order = db.get(Order, oid)
         if not order:
             raise HTTPException(404, "Order not found")
-        if order.status == "confirmed":
-            return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items])
+        if order.status == ORDER_STATUS_CANCELLED:
+            raise HTTPException(409, "Order already cancelled")
+        if order.status == ORDER_STATUS_CONFIRMED:
+            return _order_to_out(order)
         # Atomic inventory update
         for item in order.items:
             prod: Product = db.get(Product, item.product_id)
@@ -1540,10 +1813,28 @@ def confirm_order(request: Request, oid: str):
                 raise HTTPException(409, f"Item not confirmable: {item.product_id} ({reason})")
             prod.qty = max(0, prod.qty - 1)
             prod.available = prod.qty > 0 and prod.available
-        order.status = "confirmed"
-        order.confirmed_at = datetime.utcnow().isoformat()
+        order.status = ORDER_STATUS_CONFIRMED
+        now = _now_iso()
+        order.confirmed_at = now
+        order.updated_at = now
         db.flush()
-        return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items], created_at=order.created_at, confirmed_at=order.confirmed_at, removed_items=order.removed_items)
+        return _order_to_out(order)
+
+@app.patch("/orders/{oid}/cancel", response_model=OrderOut)
+def cancel_order(request: Request, oid: str):
+    require_admin(request)
+    with session_scope() as db:
+        order: Order = db.get(Order, oid)
+        if not order:
+            raise HTTPException(404, "Order not found")
+        if order.status == ORDER_STATUS_CONFIRMED:
+            raise HTTPException(409, "Order already confirmed")
+        if order.status == ORDER_STATUS_CANCELLED:
+            return _order_to_out(order)
+        order.status = ORDER_STATUS_CANCELLED
+        order.updated_at = _now_iso()
+        db.flush()
+        return _order_to_out(order)
 
 class OrdersListOut(BaseModel):
     items: List[OrderOut]
@@ -1559,10 +1850,13 @@ def list_orders(request: Request, status: Optional[str] = None, limit: int = 100
         if status:
             qry = qry.filter(Order.status == status)
         total = qry.count()
-        page = qry.order_by(Order.created_at.desc()).offset(max(0,int(offset))).limit(max(0,int(limit))).all()
-        out: List[OrderOut] = []
-        for o in page:
-            out.append(OrderOut(id=o.id, status=o.status, customer_phone=o.customer_phone, items=[i.product_id for i in o.items], created_at=o.created_at, confirmed_at=o.confirmed_at, removed_items=o.removed_items))
+        page = (
+            qry.order_by(Order.updated_at.desc().nullslast(), Order.created_at.desc().nullslast())
+            .offset(max(0, int(offset)))
+            .limit(max(0, int(limit)))
+            .all()
+        )
+        out = [_order_to_out(o) for o in page]
         next_offset = (offset + limit) if (offset + limit) < total else None
         return {"items": out, "total": total, "next_offset": next_offset}
 
@@ -1573,14 +1867,16 @@ def remove_order_item(request: Request, oid: str, pid: str = Body(..., embed=Tru
         order: Order = db.get(Order, oid)
         if not order:
             raise HTTPException(404, "Order not found")
+        if order.status == ORDER_STATUS_CANCELLED:
+            raise HTTPException(409, "Order cancelled")
         # remove item association
         order.items = [i for i in order.items if i.product_id != pid]
-        # track removed list
         removed = set(order.removed_items or [])
         removed.add(pid)
         order.removed_items = list(removed)
+        order.updated_at = _now_iso()
         db.flush()
-        return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items], created_at=order.created_at, confirmed_at=order.confirmed_at, removed_items=order.removed_items)
+        return _order_to_out(order)
 
 @app.patch("/orders/{oid}/add_item", response_model=OrderOut)
 def add_order_item(request: Request, oid: str, pid: str = Body(..., embed=True)):
@@ -1589,21 +1885,20 @@ def add_order_item(request: Request, oid: str, pid: str = Body(..., embed=True))
         order: Order = db.get(Order, oid)
         if not order:
             raise HTTPException(404, "Order not found")
-        # validate product exists
+        if order.status in {ORDER_STATUS_CANCELLED, ORDER_STATUS_CONFIRMED}:
+            raise HTTPException(409, "Order is not editable")
         prod: Product = db.get(Product, pid)
         if not prod:
             raise HTTPException(400, f"Product not found: {pid}")
-        # add back only if not already present
-        existing_ids = {i.product_id for i in order.items}
-        if pid not in existing_ids:
-            db.add(OrderItem(order=order, product_id=pid, qty=1))
-        # remove from removed list if present
-        removed = set(order.removed_items or [])
-        if pid in removed:
-            removed.remove(pid)
-            order.removed_items = list(removed)
+        if any(i.product_id == pid for i in order.items):
+            return _order_to_out(order)
+        db.add(OrderItem(order=order, product_id=pid, qty=1))
+        order.removed_items = [i for i in (order.removed_items or []) if i != pid]
+        if order.status == ORDER_STATUS_ABANDONED_CART:
+            order.status = ORDER_STATUS_ACTIVE_CART
+        order.updated_at = _now_iso()
         db.flush()
-        return OrderOut(id=order.id, status=order.status, customer_phone=order.customer_phone, items=[i.product_id for i in order.items], created_at=order.created_at, confirmed_at=order.confirmed_at, removed_items=order.removed_items)
+        return _order_to_out(order)
 
 # ----- Notes -----
 # • For Lambda deploy, add:
