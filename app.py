@@ -411,17 +411,49 @@ ses = boto3.client(
 
 def send_owner_email_api(req: NotifyRequest):
     """Fire email via SES API. Raises on hard failures; FastAPI will log it."""
-    subject = f"New order request #{req.orderId}"
-    text = (
-        f"New order request {req.orderId}\n"
-        f"Items: {', '.join(req.items) if req.items else '—'}\n"
-        f"Customer: {req.customerPhone or '—'}\n"
-    )
-    html = (
-        f"<h2>New order request {req.orderId}</h2>"
-        f"<p><b>Items:</b> {', '.join(req.items) if req.items else '—'}</p>"
-        f"<p><b>Customer:</b> {req.customerPhone or '—'}</p>"
-    )
+    items_list = req.items or []
+    item_count = len(items_list)
+    owner_link = "https://16shringaar.com/owner"
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    if req.stage == "cart_created":
+        subject = f"New shortlist started: {req.orderId} ({item_count} item{'s' if item_count != 1 else ''})"
+        intro = "A shopper just started a shortlist."
+    elif req.stage == "order_confirmed":
+        subject = f"Order confirmed: {req.orderId} ({item_count} item{'s' if item_count != 1 else ''})"
+        intro = "You confirmed this order. Inventory has been updated automatically."
+    else:
+        subject = f"Customer submitted order: {req.orderId} ({item_count} item{'s' if item_count != 1 else ''})"
+        intro = "A customer just submitted this order from the shop experience."
+
+    items_text = ", ".join(items_list) if items_list else "—"
+    session_hint = req.sessionId or "—"
+
+    text_lines = [
+        intro,
+        "",
+        f"Order ID: {req.orderId}",
+        f"Items: {items_text}",
+        f"Customer phone: {req.customerPhone or '—'}",
+        f"Session: {session_hint}",
+        f"Timestamp: {timestamp}",
+        f"View shortlist: {owner_link}",
+    ]
+    text = "\n".join(text_lines)
+
+    html_lines = [
+        f"<h2>{subject}</h2>",
+        f"<p>{intro}</p>",
+        "<ul>",
+        f"  <li><b>Order ID:</b> {req.orderId}</li>",
+        f"  <li><b>Items:</b> {items_text or '—'}</li>",
+        f"  <li><b>Customer phone:</b> {req.customerPhone or '—'}</li>",
+        f"  <li><b>Session:</b> {session_hint}</li>",
+        f"  <li><b>Timestamp:</b> {timestamp}</li>",
+        "</ul>",
+        f"<p><a href=\"{owner_link}\">Open shortlist in owner view</a></p>",
+    ]
+    html = "".join(html_lines)
     try:
         ses.send_email(
             Source=MAIL_FROM,  # must be SES-verified (email or domain)
@@ -876,6 +908,13 @@ def _clean_phone(value: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+"""Backend entry point defining product/catalog/cart APIs used by both customer and owner UIs.
+
+The module keeps cart state reusable across devices, hydrates missing catalog entries on demand,
+and exposes lightweight endpoints so the frontend can stay responsive without manual refreshes.
+"""
+
+
 def _find_existing_cart(
     db: Session,
     *,
@@ -883,6 +922,7 @@ def _find_existing_cart(
     session_id: Optional[str],
     allowed_statuses: Optional[Set[str]] = None,
 ) -> Optional[Order]:
+    """Return the freshest cart matching phone/session limited to reusable statuses."""
     phone = _clean_phone(customer_phone)
     session = (session_id or None)
     statuses = allowed_statuses or CART_REUSABLE_STATUSES
@@ -906,6 +946,7 @@ def _find_existing_cart(
 def _get_or_create_cart(
     db: Session, *, customer_phone: Optional[str], session_id: Optional[str], allow_create: bool
 ) -> Optional[Order]:
+    """Resolve the active cart for a customer; create one only when explicitly allowed."""
     phone = _clean_phone(customer_phone)
     session = (session_id or None)
 
@@ -937,6 +978,15 @@ def _get_or_create_cart(
     new_order.updated_at = now
     db.add(new_order)
     db.flush()
+    try:
+        LOGGER.info(
+            "cart created: id=%s phone=%s session=%s",
+            new_order.id,
+            phone,
+            session or "",
+        )
+    except Exception:
+        pass
     return new_order
 
 
@@ -1732,11 +1782,26 @@ def sync_cart(req: CartSyncRequest):
             order.customer_phone = phone_clean
         if req.session_id and order.session_id != req.session_id:
             order.session_id = req.session_id
+        prior_count = len(order.items)
         _sync_order_items(order, desired_items, db)
         if order.status != ORDER_STATUS_ACTIVE_CART:
             order.status = ORDER_STATUS_ACTIVE_CART
         order.updated_at = _now_iso()
         db.flush()
+        try:
+            if prior_count == 0 and len(order.items) > 0:
+                send_owner_email_api(
+                    NotifyRequest(
+                        orderId=order.id,
+                        items=[item.product_id for item in order.items],
+                        customerPhone=order.customer_phone,
+                        sessionId=order.session_id,
+                        stage="cart_created",
+                    )
+                )
+                LOGGER.info("cart notify sent: order=%s", order.id)
+        except Exception:
+            LOGGER.warning("cart notify failed", exc_info=True)
         return _order_to_out(order)
 
 
@@ -1764,6 +1829,27 @@ def create_order(req: OrderCreate):
             order.created_at = now
         order.updated_at = now
         db.flush()
+        try:
+            LOGGER.info(
+                "order submitted: id=%s status=%s items=%d phone=%s session=%s",
+                order.id,
+                order.status,
+                len(req.items),
+                phone,
+                req.session_id or "",
+            )
+            send_owner_email_api(
+                NotifyRequest(
+                    orderId=order.id,
+                    items=list(req.items),
+                    customerPhone=phone,
+                    sessionId=req.session_id,
+                    stage="order_submitted",
+                )
+            )
+            LOGGER.info("order notify sent: order=%s", order.id)
+        except Exception:
+            LOGGER.warning("order notify failed", exc_info=True)
         return _order_to_out(order)
 
 
@@ -1772,12 +1858,23 @@ class NotifyRequest(BaseModel):
     orderId: str
     items: list[str]
     customerPhone: str
+    sessionId: Optional[str] = None
+    stage: str = "order_submitted"  # cart_created | order_submitted | order_confirmed
 
 @app.post("/notify-owner")
 def notify_owner(req: NotifyRequest, background: BackgroundTasks):
     # Fire-and-forget so the UI never blocks on email
     if not (MAIL_FROM and OWNER_EMAIL):
         raise HTTPException(500, "Email sender/recipient not configured")
+    try:
+        LOGGER.info(
+            "notify_owner queued: order=%s items=%d phone=%s",
+            req.orderId,
+            len(req.items or []),
+            req.customerPhone,
+        )
+    except Exception:
+        pass
     background.add_task(send_owner_email_api, req)
     return {"ok": True}
 
@@ -1818,6 +1915,19 @@ def confirm_order(request: Request, oid: str):
         order.confirmed_at = now
         order.updated_at = now
         db.flush()
+        try:
+            send_owner_email_api(
+                NotifyRequest(
+                    orderId=order.id,
+                    items=[item.product_id for item in order.items],
+                    customerPhone=order.customer_phone,
+                    sessionId=order.session_id,
+                    stage="order_confirmed",
+                )
+            )
+            LOGGER.info("confirm notify sent: order=%s", order.id)
+        except Exception:
+            LOGGER.warning("confirm notify failed", exc_info=True)
         return _order_to_out(order)
 
 @app.patch("/orders/{oid}/cancel", response_model=OrderOut)
