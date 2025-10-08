@@ -36,7 +36,7 @@ from collections import defaultdict, deque
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from sqlalchemy import create_engine, Column, String, Integer, Boolean, JSON, text, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, Boolean, JSON, text, ForeignKey, func
 from datetime import datetime, timedelta
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
@@ -1576,6 +1576,37 @@ def list_products_owner(
         response.headers['Cache-Control'] = 'private, max-age=60'
         response.headers['X-Cache'] = 'MISS'
         return {"items": items, "total": total, "next_offset": next_offset}
+
+
+@app.get("/owner/inventory/stats")
+def owner_inventory_stats(request: Request):
+    """Return summary counts used for owner dashboards.
+
+    This endpoint intentionally keeps the payload small but expressive: the UI needs a quick way
+    to show “how many items are sellable right now?” without first loading pages of product
+    documents. By surfacing both the `total_*` and `ready_*` buckets we make the badge instant and
+    leave space for future analytics (e.g., paused SKUs vs. in-review SKUs) without another round
+    trip."""
+    require_admin(request)
+    with session_scope() as db:
+        ready_qty = (
+            db.query(func.coalesce(func.sum(Product.qty), 0))
+            .filter(Product.status == "ready", Product.available == True)
+            .scalar()
+        ) or 0
+        total_qty = db.query(func.coalesce(func.sum(Product.qty), 0)).scalar() or 0
+        ready_products = (
+            db.query(func.count(Product.id))
+            .filter(Product.status == "ready", Product.available == True)
+            .scalar()
+        ) or 0
+        total_products = db.query(func.count(Product.id)).scalar() or 0
+    return {
+        "total_qty": int(total_qty),
+        "ready_qty": int(ready_qty),
+        "total_products": int(total_products),
+        "ready_products": int(ready_products),
+    }
 
 
 @app.get("/owner/products/{pid}", response_model=ProductOut)
