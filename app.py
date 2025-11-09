@@ -867,6 +867,18 @@ class ProductListOut(BaseModel):
     next_offset: Optional[int] = None
 
 
+class FacetItem(BaseModel):
+    value: str
+    count: int = 0
+
+
+class ProductFiltersOut(BaseModel):
+    min_price: int
+    max_price: int
+    categories: List[FacetItem]
+    style_tags: List[FacetItem]
+
+
 def _product_to_out(m: Product, *, include_processing_error: bool = True) -> ProductOut:
     imgs = (m.images_small or []) or (m.images or [])
     return ProductOut(
@@ -1599,6 +1611,93 @@ def get_price_stats():
             "min_price": int(min_price),
             "max_price": int(max_price),
         }
+
+
+@app.get("/products/filters", response_model=ProductFiltersOut)
+def get_product_filters(
+    category: Optional[str] = None,
+    q: Optional[str] = None,
+    min_price: Optional[int] = None,
+    max_price: Optional[int] = None,
+    only_available: bool = False,
+    style_tag: Optional[str] = None,
+):
+    """Return facets constrained by the caller's current filters."""
+    min_price_val = int(min_price) if min_price is not None else None
+    max_price_val = int(max_price) if max_price is not None else None
+    style_filter = _normalize_style_tag(style_tag)
+
+    with session_scope() as db:
+
+        def filtered_query(*, skip_category=False, skip_style=False, skip_price=False):
+            query = db.query(Product).filter(Product.status == "ready")
+            if category and not skip_category:
+                query = query.filter(Product.category == category)
+            if style_filter and not skip_style:
+                query = query.filter(Product.style_tag == style_filter)
+            if q:
+                like = f"%{q}%"
+                query = query.filter((Product.title.ilike(like)) | (Product.description.ilike(like)))
+            if not skip_price:
+                if min_price_val is not None:
+                    query = query.filter(Product.price_in_paise >= min_price_val * 100)
+                if max_price_val is not None:
+                    query = query.filter(Product.price_in_paise <= max_price_val * 100)
+            if only_available:
+                query = query.filter(Product.available == True, Product.qty > 0)
+            return query
+
+        price_row = (
+            filtered_query(skip_price=True)
+            .with_entities(
+                func.min(Product.price_in_paise).label('min_price'),
+                func.max(Product.price_in_paise).label('max_price'),
+            )
+            .first()
+        )
+        min_price_rupees = (price_row.min_price or 0) // 100 if price_row and price_row.min_price else 0
+        max_price_rupees = (price_row.max_price or 0) // 100 if price_row and price_row.max_price else 0
+
+        category_rows = (
+            filtered_query(skip_category=True)
+            .with_entities(Product.category, func.count(Product.id).label('count'))
+            .group_by(Product.category)
+            .all()
+        )
+        categories = [
+            FacetItem(value=row[0], count=int(row[1]))
+            for row in category_rows
+            if row[0]
+        ]
+        categories.sort(key=lambda item: item.value.lower())
+
+        style_rows = (
+            filtered_query(skip_style=True)
+            .with_entities(Product.style_tag, func.count(Product.id).label('count'))
+            .group_by(Product.style_tag)
+            .all()
+        )
+        style_counts: dict[str, int] = {}
+        for raw_value, count in style_rows:
+            normalized = _normalize_style_tag(raw_value)
+            if not normalized:
+                continue
+            style_counts[normalized] = style_counts.get(normalized, 0) + int(count)
+
+        ordered_styles: List[FacetItem] = []
+        for opt in JEWELRY_STYLE_OPTIONS:
+            if opt in style_counts:
+                ordered_styles.append(FacetItem(value=opt, count=style_counts.pop(opt)))
+        if style_counts:
+            for remaining in sorted(style_counts.keys()):
+                ordered_styles.append(FacetItem(value=remaining, count=style_counts[remaining]))
+
+        return ProductFiltersOut(
+            min_price=int(min_price_rupees),
+            max_price=int(max_price_rupees),
+            categories=categories,
+            style_tags=ordered_styles,
+        )
 
 @app.get("/owner/inventory/stats")
 def owner_inventory_stats(request: Request):
