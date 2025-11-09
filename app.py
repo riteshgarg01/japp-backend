@@ -1578,12 +1578,34 @@ def list_products_owner(
         return {"items": items, "total": total, "next_offset": next_offset}
 
 
+@app.get("/products/price-stats")
+def get_price_stats():
+    """Return min/max prices from all ready products. Lightweight endpoint for price filter initialization.
+    
+    This allows the frontend to quickly determine the price range without fetching all products.
+    Much more efficient than fetching multiple pages just to find the max price.
+    """
+    with session_scope() as db:
+        # Get min and max prices from ready products only
+        result = db.query(
+            func.min(Product.price_in_paise).label('min_price'),
+            func.max(Product.price_in_paise).label('max_price')
+        ).filter(Product.status == "ready").first()
+        
+        min_price = (result.min_price or 0) // 100 if result.min_price else 0
+        max_price = (result.max_price or 0) // 100 if result.max_price else 0
+        
+        return {
+            "min_price": int(min_price),
+            "max_price": int(max_price),
+        }
+
 @app.get("/owner/inventory/stats")
 def owner_inventory_stats(request: Request):
     """Return summary counts used for owner dashboards.
 
     This endpoint intentionally keeps the payload small but expressive: the UI needs a quick way
-    to show “how many items are sellable right now?” without first loading pages of product
+    to show "how many items are sellable right now?" without first loading pages of product
     documents. By surfacing both the `total_*` and `ready_*` buckets we make the badge instant and
     leave space for future analytics (e.g., paused SKUs vs. in-review SKUs) without another round
     trip."""
